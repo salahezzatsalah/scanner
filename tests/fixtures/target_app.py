@@ -76,6 +76,14 @@ const LEGACY_KEY = "example-not-a-real-secret";
 """
 
 
+# Boolean markers the SQLi surrogate responds to, as a real injectable query
+# would respond to the logic rather than to the literal text.
+_Q = chr(39)
+_TRUE_MARKERS = frozenset({_Q + '1' + _Q + '=' + _Q + '1', '1=1',
+                           _Q + 'a' + _Q + '=' + _Q + 'a'})
+_FALSE_MARKERS = frozenset({_Q + '1' + _Q + '=' + _Q + '2', '1=2',
+                            _Q + 'a' + _Q + '=' + _Q + 'b'})
+
 class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "ExampleCorp/1.0"
@@ -152,23 +160,63 @@ class _Handler(BaseHTTPRequestHandler):
                 f"<!doctype html><html><head><title>Echo</title></head><body>"
                 f"<h1>You said {value}</h1></body></html>",
             )
-        # --- a genuine boolean-differential SQLi surrogate -----------------
+        # --- a genuine SQLi surrogate --------------------------------------
+        # Behaves as if the parameter were concatenated into a query: it
+        # responds to the *logic* of an injected boolean, and leaks a driver
+        # error on unbalanced quotes. Both are real injectable behaviours, and
+        # together they are what two independent oracles should agree on.
         elif path == "/sqli":
             raw = self._one(params, "id", "1")
-            truthy = raw == "1" or "1=1" in raw.replace(" ", "")
-            falsy = "1=2" in raw.replace(" ", "")
-            if falsy:
-                self._send(200, "<html><title>Item</title><body>No such item."
-                                "</body></html>")
-            elif truthy:
+            compact = raw.replace(" ", "").replace(chr(34), chr(39))
+
+            if compact.count(chr(39)) % 2 == 1:
+                self._send(
+                    200,
+                    "<html><title>Item</title><body><p>Database error: You have "
+                    "an error in your SQL syntax; check the manual that "
+                    "corresponds to your MySQL server version for the right "
+                    "syntax to use near line 1</p></body></html>",
+                )
+            elif _FALSE_MARKERS & {m for m in _FALSE_MARKERS if m in compact}:
+                self._send(
+                    200,
+                    "<html><title>Item</title><body><p>No such item.</p>"
+                    "</body></html>",
+                )
+            elif compact == "1" or {m for m in _TRUE_MARKERS if m in compact}:
                 self._send(
                     200,
                     "<html><title>Item</title><body><h1>Widget</h1>"
                     "<p>In stock: 42 units. Ships today.</p></body></html>",
                 )
             else:
-                self._send(200, "<html><title>Item</title><body>No such item."
-                                "</body></html>")
+                self._send(
+                    200,
+                    "<html><title>Item</title><body><p>No such item.</p>"
+                    "</body></html>",
+                )
+        # --- trap: reflects into a quoted attribute but encodes the quote ---
+        elif path == "/attr":
+            value = self._one(params, "q").replace(chr(34), "&quot;")
+            self._send(
+                200,
+                "<!doctype html><html><head><title>Filter</title></head><body>"
+                + chr(60) + "input type=" + chr(34) + "text" + chr(34)
+                + " name=" + chr(34) + "q" + chr(34)
+                + " value=" + chr(34) + value + chr(34) + chr(62)
+                + "</body></html>",
+            )
+        # --- a genuine XSS in a quoted attribute: the quote is NOT encoded --
+        elif path == "/attr-xss":
+            value = self._one(params, "q")
+            self._send(
+                200,
+                "<!doctype html><html><head><title>Filter</title></head><body>"
+                + chr(60) + "input type=" + chr(34) + "text" + chr(34)
+                + " name=" + chr(34) + "q" + chr(34)
+                + " value=" + chr(34) + value + chr(34) + chr(62)
+                + "</body></html>",
+            )
         # --- trap: a SQL error string that is always present ---------------
         elif path == "/static-error":
             self._send(200, _STATIC_ERROR % html.escape(self._one(params, "id", "1")))

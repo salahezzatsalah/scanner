@@ -40,6 +40,10 @@ class Settings(BaseSettings):
     reproduce_required: int = Field(default=3, ge=1)
     min_report_confidence: int = Field(default=50, ge=0, le=100)
     headless_xss_confirm: bool = True
+    # Explicit Chromium path for XSS execution confirmation. Usually
+    # unnecessary; set it when Playwright's bundled browser does not match the
+    # one installed on the machine.
+    chromium_path: str = ""
     # Number of random labels used to probe for wildcard DNS
     wildcard_probe_count: int = Field(default=3, ge=1)
     # Number of random paths used to learn a soft-404 fingerprint
