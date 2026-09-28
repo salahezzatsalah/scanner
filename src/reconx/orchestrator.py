@@ -37,6 +37,7 @@ from reconx.net.sources import SourceClient
 from reconx.scope.guard import ScopeGuard
 from reconx.scope.model import Scope
 from reconx.stages.base import Stage, StageContext, StageResult
+from reconx.stages.content import ContentStage
 from reconx.stages.passive_recon import PassiveReconStage
 from reconx.stages.resolve_probe import ResolveProbeStage
 from reconx.stages.subdomains import SubdomainStage
@@ -60,12 +61,14 @@ STAGE_REGISTRY: dict[str, type[Stage]] = {
     PassiveReconStage.name: PassiveReconStage,
     SubdomainStage.name: SubdomainStage,
     ResolveProbeStage.name: ResolveProbeStage,
+    ContentStage.name: ContentStage,
 }
 
 # Convenience names for the CLI.
 STAGE_GROUPS: dict[str, tuple[str, ...]] = {
     "recon": ("passive_recon", "subdomains", "resolve_probe"),
     "passive": ("passive_recon",),
+    "discover": ("passive_recon", "subdomains", "resolve_probe", "content"),
     "all": tuple(STAGE_REGISTRY),
 }
 

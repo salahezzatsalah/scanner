@@ -122,10 +122,18 @@ class _Handler(BaseHTTPRequestHandler):
             )
         elif path == "/static/app.js":
             self._send(200, _JS_FILE, "application/javascript")
-        elif path == "/api/users":
+        # Named only in app.js, never linked from any page. A crawler that does
+        # not read JavaScript will miss these entirely.
+        elif path == "/api/v1/users":
             self._send(
                 200,
                 json.dumps({"users": [{"id": 1, "name": "alice"}]}),
+                "application/json",
+            )
+        elif path == "/api/v1/orders":
+            self._send(
+                200,
+                json.dumps({"orders": [{"id": 7, "status": "open"}]}),
                 "application/json",
             )
         # --- a genuine reflected XSS: input lands unencoded in the body ----

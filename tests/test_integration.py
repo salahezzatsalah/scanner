@@ -449,3 +449,128 @@ async def test_nothing_to_probe_says_so_clearly(
     assert any("nothing in scope to probe" in note for note in result.notes)
     await ctx.http.aclose()
     await ctx.sources.aclose()
+
+
+# ---------------------------------------------------------------------------
+# content discovery on a soft-404 host
+# ---------------------------------------------------------------------------
+
+
+async def test_wordlist_discovery_on_a_soft_404_host_finds_only_real_paths(
+    db_session: AsyncSession, program: Program, target
+) -> None:
+    """The trap that makes path brute forcing useless without a baseline.
+
+    The fixture answers every unknown path with HTTP 200 and a not-found page, so
+    a scanner that treats 200 as "exists" reports the entire wordlist. ReconX
+    learns the not-found page first and keeps only what differs from it.
+    """
+    from reconx.db.models import Endpoint
+    from reconx.stages.content import ContentStage
+
+    scope = make_scope(in_scope=[target.host], out_of_scope=[])
+    ctx = await make_context(db_session, program, scope=scope)
+
+    # Establish the host as live so content discovery has something to explore.
+    await ResolveProbeStage(ports=(target.port,)).run(ctx)
+    await db_session.commit()
+
+    stage = ContentStage(crawl=True, archives=False, brute_force=True)
+    result = await stage.run(ctx)
+    await db_session.commit()
+
+    found = {
+        endpoint.url
+        for endpoint in (
+            await db_session.execute(
+                select(Endpoint).where(Endpoint.program_id == program.id)
+            )
+        ).scalars().all()
+    }
+    paths = {url.split(target.base_url, 1)[-1] or "/" for url in found}
+
+    # Real endpoints are found.
+    assert "/admin" in paths
+    assert "/robots.txt" in paths
+
+    # Wordlist entries that do not exist are filtered, not reported.
+    for missing in ("/phpmyadmin", "/wp-login.php", "/.aws/credentials", "/backup.sql"):
+        assert missing not in paths, f"{missing} is a soft-404 page, not a discovery"
+
+    # And the filtering is accounted for rather than silent.
+    assert result.filter_reasons.get("soft_404", 0) > 20
+    assert any("soft-404" in note for note in result.notes)
+    assert len(paths) < 25, f"too many endpoints kept, filtering is not working: {len(paths)}"
+
+    await ctx.http.aclose()
+    await ctx.sources.aclose()
+
+
+async def test_javascript_is_mined_for_endpoints_and_credentials(
+    db_session: AsyncSession, program: Program, target
+) -> None:
+    """Client-side code names endpoints that are never linked."""
+    from reconx.db.models import Endpoint, Finding
+    from reconx.stages.content import ContentStage
+
+    scope = make_scope(in_scope=[target.host], out_of_scope=[])
+    ctx = await make_context(db_session, program, scope=scope)
+    await ResolveProbeStage(ports=(target.port,)).run(ctx)
+    await db_session.commit()
+
+    await ContentStage(crawl=True, archives=False, brute_force=False).run(ctx)
+    await db_session.commit()
+
+    found = {
+        endpoint.url
+        for endpoint in (
+            await db_session.execute(
+                select(Endpoint).where(Endpoint.program_id == program.id)
+            )
+        ).scalars().all()
+    }
+    # app.js names /api/v1/users and /api/v1/orders. Neither is linked from any
+    # page, so finding them proves the JavaScript was actually read, and keeping
+    # them proves they were confirmed to exist rather than assumed.
+    assert any("/api/v1/users" in url for url in found), f"JS endpoints not mined: {found}"
+    assert any("/api/v1/orders" in url for url in found), f"JS endpoints not mined: {found}"
+
+    # The fixture's JS has no real credential, so nothing should be reported.
+    secrets = (
+        await db_session.execute(
+            select(Finding).where(Finding.vuln_class == "exposed_secret")
+        )
+    ).scalars().all()
+    assert secrets == [], "reported a credential where the fixture has none"
+
+    await ctx.http.aclose()
+    await ctx.sources.aclose()
+
+
+async def test_endpoints_are_scored_so_the_interesting_ones_surface(
+    db_session: AsyncSession, program: Program, target
+) -> None:
+    from reconx.db.models import Endpoint
+    from reconx.stages.content import ContentStage
+
+    scope = make_scope(in_scope=[target.host], out_of_scope=[])
+    ctx = await make_context(db_session, program, scope=scope)
+    await ResolveProbeStage(ports=(target.port,)).run(ctx)
+    await db_session.commit()
+    await ContentStage(crawl=True, archives=False, brute_force=True).run(ctx)
+    await db_session.commit()
+
+    rows = (
+        await db_session.execute(
+            select(Endpoint)
+            .where(Endpoint.program_id == program.id)
+            .order_by(Endpoint.interesting_score.desc())
+        )
+    ).scalars().all()
+    assert rows
+    top = rows[0]
+    assert top.interesting_score > 0
+    assert "admin" in top.url or "api" in top.url
+
+    await ctx.http.aclose()
+    await ctx.sources.aclose()
