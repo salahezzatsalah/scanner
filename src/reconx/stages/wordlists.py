@@ -14,6 +14,7 @@ __all__ = [
     "COMMON_SUBDOMAIN_LABELS",
     "PERMUTATION_AFFIXES",
     "COMMON_CONTENT_PATHS",
+    "COMMON_PARAMETER_NAMES",
     "load_wordlist",
 ]
 
@@ -81,6 +82,28 @@ COMMON_CONTENT_PATHS: tuple[str, ...] = (
     "/composer.json", "/composer.lock", "/yarn.lock", "/Gemfile",
     "/.dockerignore", "/Dockerfile", "/docker-compose.yml",
     "/.aws/credentials", "/.ssh/id_rsa", "/id_rsa", "/private.key",
+)
+
+
+# Parameter names worth trying when an endpoint declares none. Weighted
+# towards the ones that tend to reach a database, a file path or a redirect,
+# since those are where the interesting bugs live.
+COMMON_PARAMETER_NAMES: tuple[str, ...] = (
+    "id", "q", "query", "search", "s", "keyword", "term",
+    "page", "p", "offset", "limit", "start", "count", "size",
+    "sort", "order", "orderby", "dir", "filter", "category", "cat",
+    "url", "uri", "redirect", "redirect_url", "redirect_uri", "next",
+    "return", "return_url", "returnurl", "continue", "dest", "destination",
+    "target", "goto", "link", "out", "view", "callback", "jsonp",
+    "file", "filename", "path", "folder", "document", "doc",
+    "template", "include", "page_id", "download", "attachment",
+    "user", "username", "userid", "user_id", "uid", "account", "email",
+    "name", "first_name", "last_name", "token", "key", "api_key", "apikey",
+    "access_token", "auth", "session", "sid", "ref", "referrer",
+    "action", "cmd", "command", "func", "function", "method", "op", "do",
+    "type", "mode", "format", "lang", "locale", "debug", "test", "preview",
+    "data", "json", "xml", "payload", "body", "message", "comment", "content",
+    "status", "state", "value", "val", "code", "hash", "sig", "signature",
 )
 
 

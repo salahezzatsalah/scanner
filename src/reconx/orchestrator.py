@@ -38,9 +38,11 @@ from reconx.scope.guard import ScopeGuard
 from reconx.scope.model import Scope
 from reconx.stages.base import Stage, StageContext, StageResult
 from reconx.stages.content import ContentStage
+from reconx.stages.params import ParamStage
 from reconx.stages.passive_recon import PassiveReconStage
 from reconx.stages.resolve_probe import ResolveProbeStage
 from reconx.stages.subdomains import SubdomainStage
+from reconx.stages.vulns import VulnStage
 
 __all__ = [
     "STAGE_REGISTRY",
@@ -62,6 +64,8 @@ STAGE_REGISTRY: dict[str, type[Stage]] = {
     SubdomainStage.name: SubdomainStage,
     ResolveProbeStage.name: ResolveProbeStage,
     ContentStage.name: ContentStage,
+    ParamStage.name: ParamStage,
+    VulnStage.name: VulnStage,
 }
 
 # Convenience names for the CLI.
@@ -69,7 +73,9 @@ STAGE_GROUPS: dict[str, tuple[str, ...]] = {
     "recon": ("passive_recon", "subdomains", "resolve_probe"),
     "passive": ("passive_recon",),
     "discover": ("passive_recon", "subdomains", "resolve_probe", "content"),
+    "vulns": ("vulns",),
     "all": tuple(STAGE_REGISTRY),
+    "full": tuple(STAGE_REGISTRY),
 }
 
 
@@ -163,6 +169,28 @@ class RunSummary:
         return sorted(set(out))
 
     @property
+    def new_endpoints(self) -> list[str]:
+        out: list[str] = []
+        for result in self.stages.values():
+            out.extend(result.new_endpoints)
+        return sorted(set(out))
+
+    @property
+    def findings(self) -> list[str]:
+        """Findings that surfaced, most severe first."""
+        order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+
+        def rank(label: str) -> tuple[int, int, str]:
+            severity = next((key for key in order if f"{key}:" in label), "INFO")
+            confirmed = 0 if label.startswith("CONFIRMED") else 1
+            return (order[severity], confirmed, label)
+
+        out: list[str] = []
+        for result in self.stages.values():
+            out.extend(result.new_findings)
+        return sorted(set(out), key=rank)
+
+    @property
     def total_filtered(self) -> int:
         return sum(result.items_filtered for result in self.stages.values())
 
@@ -177,6 +205,8 @@ class RunSummary:
             "out_of_scope_blocked": self.out_of_scope_blocked,
             "source_calls": self.source_calls,
             "new_assets": self.new_assets,
+            "new_endpoints": self.new_endpoints,
+            "findings": self.findings,
             "total_filtered": self.total_filtered,
             "stages": {name: result.as_dict() for name, result in self.stages.items()},
             "skipped": dict(self.skipped),

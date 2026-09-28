@@ -390,6 +390,33 @@ def scan_run(
             help="Use only the built-in Python paths, ignoring installed scanners",
         ),
     ] = False,
+    no_archives: Annotated[
+        bool,
+        typer.Option("--no-archives", help="Skip historical URL sources (Wayback, gau)"),
+    ] = False,
+    no_nuclei: Annotated[
+        bool, typer.Option("--no-nuclei", help="Skip nuclei template scanning")
+    ] = False,
+    no_timing: Annotated[
+        bool,
+        typer.Option(
+            "--no-timing",
+            help=(
+                "Skip the time-based SQL injection oracle. Much faster, and it never "
+                "confirms a finding on its own anyway"
+            ),
+        ),
+    ] = False,
+    no_headless: Annotated[
+        bool,
+        typer.Option(
+            "--no-headless",
+            help=(
+                "Skip browser confirmation for XSS. Real findings drop to Probable "
+                "rather than being lost"
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Run the pipeline against a program."""
 
@@ -397,14 +424,27 @@ def scan_run(
         scope, raw, slug = await _resolve_program(program)
         await init_db()
 
+        from reconx.stages.content import ContentStage
+        from reconx.stages.params import ParamStage
         from reconx.stages.subdomains import SubdomainStage
+        from reconx.stages.vulns import VulnStage
 
         overrides = {
             "subdomains": SubdomainStage(
                 wordlist_path=wordlist,
                 brute_force=not no_brute,
                 max_wildcard_http_checks=max_wildcard_checks,
-            )
+            ),
+            "content": ContentStage(
+                brute_force=not no_brute,
+                archives=not no_archives,
+            ),
+            "params": ParamStage(guess_hidden=not no_brute),
+            "vulns": VulnStage(
+                run_nuclei=not no_nuclei,
+                enable_timing=not no_timing,
+                headless_xss=not no_headless,
+            ),
         }
 
         console.print(
@@ -478,12 +518,32 @@ def _print_summary(summary, slug: str) -> None:
         f"Source calls: {summary.source_calls}   "
         f"Out-of-scope blocked: {summary.out_of_scope_blocked}"
     )
+    if summary.findings:
+        console.print()
+        console.print(
+            Panel(
+                "\n".join(f"  {entry}" for entry in summary.findings[:30]),
+                title=f"{len(summary.findings)} finding(s) surfaced",
+                border_style="red",
+            )
+        )
+        if len(summary.findings) > 30:
+            console.print(f"  ...and {len(summary.findings) - 30} more")
+        console.print(
+            f"See them all: [bold]reconx findings list {slug}[/bold]   "
+            f"Audit what was filtered out: "
+            f"[bold]reconx findings list {slug} --tier discarded[/bold]"
+        )
+
     if summary.new_assets:
         console.print(f"\n[green]{len(summary.new_assets)} new asset(s):[/green]")
         for host in summary.new_assets[:25]:
             console.print(f"  + {host}")
         if len(summary.new_assets) > 25:
             console.print(f"  ...and {len(summary.new_assets) - 25} more")
+
+    if summary.new_endpoints:
+        console.print(f"\n[green]{len(summary.new_endpoints)} new endpoint(s)[/green]")
     if summary.error:
         err_console.print(f"\n[red]Run error:[/red] {summary.error}")
 

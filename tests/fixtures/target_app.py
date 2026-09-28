@@ -39,7 +39,13 @@ _HOME = """<!doctype html><html><head><title>Example Corp</title></head>
 <body><h1>Welcome to Example Corp</h1>
 <p>We sell examples. Browse our <a href="/products">products</a> or
 <a href="/admin">sign in</a>.</p>
-<form action="/search"><input name="q"><input name="page"></form>
+<p>Popular: <a href="/sqli?id=1">Widget</a> &middot;
+<a href="/static-error?id=1">Gadget</a> &middot;
+<a href="/attr?q=blue">Filter by colour</a> &middot;
+<a href="/attr-xss?q=blue">Saved filter</a> &middot;
+<a href="/reflect?q=hello">Echo</a> &middot;
+<a href="/jitter?id=1">Slow report</a></p>
+<form action="/xss"><input name="q"><input name="page"></form>
 <script src="/static/app.js"></script></body></html>"""
 
 _ADMIN = """<!doctype html><html><head><title>Administrator sign in</title></head>

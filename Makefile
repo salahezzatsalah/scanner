@@ -5,6 +5,7 @@ help:
 	@echo "bootstrap  - install the Go scanner binaries and nuclei templates"
 	@echo "doctor     - report which external tools are available"
 	@echo "test       - run the test suite"
+	@echo "test-fast  - run everything except the slow end-to-end tests"
 	@echo "lint       - ruff check"
 	@echo "fmt        - ruff format"
 	@echo "clean      - remove caches and build artifacts"
@@ -20,6 +21,9 @@ doctor:
 
 test:
 	python3 -m pytest -q
+
+test-fast:
+	python3 -m pytest -q -m "not slow"
 
 lint:
 	python3 -m ruff check src tests

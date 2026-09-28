@@ -456,6 +456,7 @@ async def test_nothing_to_probe_says_so_clearly(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 async def test_wordlist_discovery_on_a_soft_404_host_finds_only_real_paths(
     db_session: AsyncSession, program: Program, target
 ) -> None:
@@ -574,3 +575,150 @@ async def test_endpoints_are_scored_so_the_interesting_ones_surface(
 
     await ctx.http.aclose()
     await ctx.sources.aclose()
+
+
+# ---------------------------------------------------------------------------
+# the whole pipeline
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.slow
+async def test_full_pipeline_surfaces_real_bugs_and_discards_the_traps(
+    file_db, target
+) -> None:
+    """The end-to-end claim, run through the orchestrator.
+
+    The fixture links six parameterised endpoints from its home page. Three are
+    genuinely vulnerable and three are traps that other scanners report. Nothing
+    is hinted to the pipeline: it crawls, discovers the parameters, and decides.
+    """
+    from sqlalchemy import select as sa_select
+
+    from reconx.db.models import Finding, FindingTier
+    from reconx.db.session import get_session_factory
+    from reconx.orchestrator import Orchestrator
+    from reconx.stages.content import ContentStage
+    from reconx.stages.params import ParamStage
+    from reconx.stages.resolve_probe import ResolveProbeStage
+    from reconx.stages.vulns import VulnStage
+
+    scope = make_scope(
+        program="Pipeline Test Target", in_scope=[target.host], out_of_scope=[]
+    )
+    orchestrator = Orchestrator(
+        scope,
+        use_external_tools=False,
+        stage_instances={
+            "resolve_probe": ResolveProbeStage(ports=(target.port,)),
+            "content": ContentStage(crawl=True, archives=False, brute_force=False),
+            "params": ParamStage(guess_hidden=False),
+            # Timing is skipped for speed; it never confirms alone anyway.
+            "vulns": VulnStage(
+                run_nuclei=False, enable_timing=False, headless_xss=True,
+                check_takeover=False,
+            ),
+        },
+    )
+    summary = await orchestrator.run(["full"])
+    assert summary.status.value == "completed", summary.error
+
+    factory = get_session_factory()
+    async with factory() as session:
+        findings = (await session.execute(sa_select(Finding))).scalars().all()
+
+    confirmed = {
+        f.title for f in findings if f.tier is FindingTier.CONFIRMED
+    }
+    discarded = {
+        f.title: (f.discard_reason or "") for f in findings
+        if f.tier is FindingTier.DISCARDED
+    }
+
+    # --- the real bugs, found without being told where to look -------------
+    assert any("SQL injection" in title and "/sqli" in title for title in confirmed), (
+        f"the injectable endpoint was not confirmed: {confirmed}"
+    )
+    assert any("/xss" in title for title in confirmed), (
+        f"the HTML-body XSS was not confirmed: {confirmed}"
+    )
+    assert any("/attr-xss" in title for title in confirmed), (
+        f"the attribute XSS was not confirmed: {confirmed}"
+    )
+
+    # --- the traps, discarded for the right reasons -------------------------
+    static_error = next(
+        (reason for title, reason in discarded.items()
+         if "SQL injection" in title and "/static-error" in title),
+        None,
+    )
+    assert static_error is not None, "the always-errors page was not discarded"
+    assert "already present in the unmodified page" in static_error
+
+    reflect = next(
+        (reason for title, reason in discarded.items()
+         if "cross-site scripting" in title and "/reflect" in title),
+        None,
+    )
+    assert reflect is not None, "the encoded reflection was not discarded"
+    assert "inert" in reflect
+
+    attr = next(
+        (reason for title, reason in discarded.items()
+         if "cross-site scripting" in title and "/attr'" in f"{title}'"
+         and "/attr-xss" not in title),
+        None,
+    )
+    assert attr is not None, f"the encoded attribute was not discarded: {list(discarded)}"
+    assert "inert" in attr
+
+    # --- nothing vulnerable was reported on the safe endpoints -------------
+    assert not any("/reflect" in title for title in confirmed)
+    assert not any("/static-error" in title for title in confirmed)
+
+    # --- every confirmed finding carries a runnable reproduction -----------
+    from reconx.db.models import Evidence
+
+    async with factory() as session:
+        evidence = (await session.execute(sa_select(Evidence))).scalars().all()
+    curls = [item.curl_command for item in evidence if item.curl_command]
+    assert curls, "confirmed findings must carry a reproduction command"
+    assert all(command.startswith("curl ") for command in curls)
+
+
+@pytest.mark.slow
+async def test_pipeline_reports_what_it_filtered(file_db, target) -> None:
+    """Filtering has to be inspectable, not a black box."""
+    from reconx.orchestrator import Orchestrator
+    from reconx.stages.content import ContentStage
+    from reconx.stages.params import ParamStage
+    from reconx.stages.resolve_probe import ResolveProbeStage
+    from reconx.stages.vulns import VulnStage
+
+    scope = make_scope(
+        program="Filter Accounting Target", in_scope=[target.host], out_of_scope=[]
+    )
+    orchestrator = Orchestrator(
+        scope,
+        use_external_tools=False,
+        stage_instances={
+            "resolve_probe": ResolveProbeStage(ports=(target.port,)),
+            "content": ContentStage(crawl=True, archives=False, brute_force=True),
+            "params": ParamStage(guess_hidden=False),
+            "vulns": VulnStage(
+                run_nuclei=False, enable_timing=False, headless_xss=False,
+                check_takeover=False,
+            ),
+        },
+    )
+    summary = await orchestrator.run(["full"])
+
+    content = summary.stages["content"]
+    assert content.filter_reasons.get("soft_404", 0) > 20, (
+        "the soft-404 filter did not account for what it dropped"
+    )
+    vulns = summary.stages["vulns"]
+    assert (
+        vulns.filter_reasons.get("sqli_not_confirmed", 0)
+        + vulns.filter_reasons.get("xss_not_confirmed", 0)
+    ) >= 3, "discarded candidates were not counted"
+    assert summary.total_filtered > 20

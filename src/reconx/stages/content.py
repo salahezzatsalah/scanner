@@ -145,9 +145,9 @@ class ContentStage(Stage):
         summary = collector.summary()
         if summary["soft_404_directories"]:
             result.note(
-                f"{len(summary['soft_404_directories'])} directory/directories answer "
-                "missing paths with a success status; discovery there was filtered "
-                "against the learned page"
+                f"{len(summary['soft_404_directories'])} directory/directories serve a "
+                "soft-404: missing paths come back with a success status. Discovery "
+                "there was filtered against the learned not-found page"
             )
         if summary["obstructed_directories"]:
             result.note(
@@ -529,11 +529,10 @@ class ContentStage(Stage):
             )
             if is_missing:
                 result.filtered("soft_404")
-                if reason:
-                    # Say it once per host so the filtering is inspectable.
-                    result.note(reason)
                 continue
             if reason:
+                # Only surfaced when a baseline could not be used, which is worth
+                # knowing. Matches are counted, not narrated.
                 result.note(reason)
 
             # A 404 or 410 is a real absence.
