@@ -33,6 +33,7 @@ from reconx.report.repro import curl_command
 from reconx.stages.base import Stage, StageContext, StageResult
 from reconx.tools.base import ToolNotAvailable
 from reconx.triage.priority import compute_priority
+from reconx.verify.base import Evidence, EvidenceRequest, PreparedRequest, try_fetch
 from reconx.verify.baseline import BaselineCollector
 from reconx.verify.reproduce import reproduce
 from reconx.verify.sqli import SqliVerifier
@@ -329,12 +330,13 @@ class VulnStage(Stage):
             hosts=[host],
             detector=f"nuclei:{template_id}",
             evidence=[
-                {
-                    "label": "nuclei match",
-                    "request_url": matched_at,
-                    "response_status": first.status,
-                    "note": f"tags: {', '.join(str(tag) for tag in tags)}",
-                }
+                Evidence.comparison(
+                    "nuclei match",
+                    payload=PreparedRequest(url=matched_at),
+                    roles=("match", "control"),
+                    note=f"tags: {', '.join(str(tag) for tag in tags)}",
+                    response_status=first.status,
+                )
             ],
             recommendation=(
                 f"Open {matched_at} and confirm the template's claim by hand. Nuclei "
@@ -438,13 +440,9 @@ class VulnStage(Stage):
     ) -> None:
         host = urlsplit(verdict.url).hostname or ""
         template = normalize_path_template(verdict.url)
-        signals = (
-            verdict.agreeing
-            if hasattr(verdict, "agreeing")
-            else (["reflection", "context_escape"] if verdict.vulnerable else [])
-        )
-        if getattr(verdict, "dom_confirmed", False):
-            signals = [*signals, "browser_execution"]
+        # Every verdict now declares its own signals, so the stage no longer has
+        # to guess them from the verifier's class.
+        signals = list(verdict.signals or verdict.agreeing)
 
         await self._save(
             ctx,
@@ -481,7 +479,7 @@ class VulnStage(Stage):
         signals: list[str],
         hosts: list[str],
         detector: str,
-        evidence: list[dict] | None = None,
+        evidence: list[Evidence] | None = None,
         asset_id: int | None = None,
         obstructed: bool = False,
         recommendation: str | None = None,
@@ -521,21 +519,7 @@ class VulnStage(Stage):
         await ctx.session.flush()
 
         for item in evidence or []:
-            request_url = item.get("request_url") or item.get("payload_url") or item.get(
-                "true_url"
-            )
-            await add_evidence(
-                ctx.session,
-                finding.id,
-                kind="request_response",
-                label=str(item.get("label") or "")[:120],
-                request_method="GET",
-                request_url=request_url,
-                response_status=item.get("response_status"),
-                response_excerpt=str(item.get("snippet") or "")[:4000] or None,
-                note=str(item.get("note") or "")[:2000] or None,
-                curl_command=curl_command("GET", request_url) if request_url else None,
-            )
+            await self._save_evidence(ctx, finding.id, item)
 
         if tier in (FindingTier.CONFIRMED, FindingTier.PROBABLE):
             self._surfaced += 1
@@ -543,6 +527,53 @@ class VulnStage(Stage):
             if label not in result.new_findings:
                 result.new_findings.append(label)
         del is_new
+
+    async def _save_evidence(self, ctx: StageContext, finding_id: int, item: Evidence) -> None:
+        """Write one piece of evidence, keeping every request it rests on.
+
+        Evidence is usually a comparison, and the control half is what makes the
+        payload half mean anything. The previous writer looked for one of three
+        known keys and dropped the rest, so ``control_url``, ``false_url`` and
+        ``surviving_chars`` never reached the database and a reviewer was handed
+        a conclusion with half its proof. Each request now becomes its own row,
+        with its own runnable reproduction.
+        """
+        requests = item.requests or [EvidenceRequest(role="observed")]
+        note = item.rendered_note()
+        multi = len(requests) > 1
+
+        for index, request in enumerate(requests):
+            label = f"{item.label} ({request.role})" if multi else item.label
+            headers = dict(request.headers)
+            await add_evidence(
+                ctx.session,
+                finding_id,
+                kind="request_response",
+                label=label[:120],
+                request_method=request.method or "GET",
+                request_url=request.url or None,
+                request_headers=headers,
+                request_body=request.body,
+                response_status=request.status or item.detail.get("response_status"),
+                # The body excerpt belongs to the request that produced the
+                # signal, not to the control it is compared against.
+                response_excerpt=(item.snippet[:4000] or None) if index == 0 else None,
+                note=(note[:2000] or None) if index == 0 else f"the {request.role} request",
+                curl_command=(
+                    curl_command(
+                        request.method or "GET",
+                        request.url,
+                        headers=headers,
+                        body=request.body,
+                        # A cookie-borne payload does not reproduce without its
+                        # cookie, so it is kept here even though reproductions
+                        # otherwise strip them.
+                        include_cookies=True,
+                    )
+                    if request.url
+                    else None
+                ),
+            )
 
     # -- helpers ------------------------------------------------------------
 
@@ -566,7 +597,5 @@ class VulnStage(Stage):
         return out
 
     async def _get(self, ctx: StageContext, url: str):
-        try:
-            return await ctx.http.get(url)
-        except Exception:
-            return None
+        result = await try_fetch(ctx.http, url)
+        return result.response

@@ -22,7 +22,8 @@ from dataclasses import dataclass, field
 from reconx.db.models import BaselineKind
 from reconx.db.store import save_baseline
 from reconx.net.fingerprint import ResponseFingerprint
-from reconx.verify.waf import WafState, classify_response
+from reconx.verify.base import PreparedRequest, Verifier
+from reconx.verify.waf import WafState
 
 __all__ = ["DirectoryBaseline", "BaselineCollector"]
 
@@ -97,8 +98,17 @@ class DirectoryBaseline:
         )
 
 
-class BaselineCollector:
-    """Learns and caches per-host, per-directory baselines."""
+class BaselineCollector(Verifier):
+    """Learns and caches per-host, per-directory baselines.
+
+    A :class:`~reconx.verify.base.Verifier` for its transport rather than its
+    verdicts: it produces no findings, but it shares the one fetch helper so a
+    failed probe is recorded as a failure rather than quietly becoming "no
+    baseline".
+    """
+
+    vuln_class = ""
+    title = "not-found baseline"
 
     def __init__(
         self,
@@ -109,7 +119,7 @@ class BaselineCollector:
         program_id: int | None = None,
         persist: bool = True,
     ) -> None:
-        self._http = http
+        super().__init__(http, attempts=1, required=1)
         self._probes = max(1, probes)
         self._session = session
         self._program_id = program_id
@@ -137,15 +147,13 @@ class BaselineCollector:
 
         for _ in range(self._probes):
             probe_url = f"{base_url.rstrip('/')}{normalized}{_random_segment()}"
-            try:
-                response = await self._http.get(probe_url)
-            except Exception as exc:
-                baseline.note = f"probe failed: {type(exc).__name__}"
+            result = await self.fetch(PreparedRequest(url=probe_url))
+            if not result.ok:
+                baseline.note = f"probe failed: {result.error}"
                 continue
 
-            verdict = classify_response(
-                status=response.status, headers=response.headers, body=response.body
-            )
+            response = result.response
+            verdict = result.obstruction()
             if verdict.state is not WafState.CLEAN:
                 baseline.obstructed = True
                 baseline.note = (
@@ -205,13 +213,12 @@ class BaselineCollector:
         key = base_url.rstrip("/")
         if key in self._normal:
             return self._normal[key]
-        try:
-            response = await self._http.get(f"{key}/")
-        except Exception:
+        result = await self.fetch(PreparedRequest(url=f"{key}/"))
+        if not result.ok:
             self._normal[key] = None
             return None
 
-        fingerprint = response.fingerprint
+        fingerprint = result.response.fingerprint
         if self._persist:
             await save_baseline(
                 self._session,
@@ -223,6 +230,10 @@ class BaselineCollector:
             )
         self._normal[key] = fingerprint
         return fingerprint
+
+    async def verify(self, base_url: str, directory: str = "/") -> DirectoryBaseline:
+        """Learning a baseline *is* this collector's verification step."""
+        return await self.for_directory(base_url, directory)
 
     # -- reporting ----------------------------------------------------------
 

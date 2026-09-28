@@ -21,9 +21,10 @@ Any one of those alone is a guess. All three together is a finding.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from reconx.db.models import FindingTier, Severity
+from reconx.verify.base import Evidence, PreparedRequest, Verdict, Verifier
 
 __all__ = ["ServiceSignature", "TakeoverVerdict", "TakeoverVerifier", "SERVICE_SIGNATURES"]
 
@@ -149,31 +150,19 @@ SERVICE_SIGNATURES: tuple[ServiceSignature, ...] = (
 
 
 @dataclass
-class TakeoverVerdict:
-    host: str
-    tier: FindingTier
-    confidence: int
+class TakeoverVerdict(Verdict):
+    host: str = ""
     service: str | None = None
     severity: Severity = Severity.INFO
     cname: str | None = None
-    reason: str = ""
-    signals: list[str] = field(default_factory=list)
-    evidence: list[dict] = field(default_factory=list)
-
-    @property
-    def vulnerable(self) -> bool:
-        return self.tier in (FindingTier.CONFIRMED, FindingTier.PROBABLE)
 
     def as_dict(self) -> dict:
         return {
+            **super().as_dict(),
             "host": self.host,
-            "tier": self.tier.value,
-            "confidence": self.confidence,
             "service": self.service,
             "severity": self.severity.value,
             "cname": self.cname,
-            "signals": list(self.signals),
-            "reason": self.reason,
         }
 
 
@@ -199,29 +188,34 @@ def find_marker_only(body: str) -> ServiceSignature | None:
     return None
 
 
-class TakeoverVerifier:
+class TakeoverVerifier(Verifier):
     """Checks whether a name delegates to an unclaimed third-party resource."""
 
-    def __init__(self, http, resolver) -> None:
-        self._http = http
+    vuln_class = "subdomain_takeover"
+    title = "Subdomain takeover"
+
+    def __init__(self, http, resolver, *, attempts: int = 3, required: int = 3) -> None:
+        super().__init__(http, attempts=attempts, required=required)
         self._resolver = resolver
 
     async def verify(self, host: str) -> TakeoverVerdict:
-        verdict = TakeoverVerdict(host=host, tier=FindingTier.DISCARDED, confidence=0)
+        verdict = TakeoverVerdict(host=host)
 
         cname_answer = await self._resolver.resolve(host, "CNAME")
         cname = cname_answer.values[0] if cname_answer.values else None
         verdict.cname = cname
 
-        response = await self._fetch(host)
-        if response is None:
+        result = await self._reach(host)
+        if not result.ok:
             verdict.reason = (
                 "the host did not answer over HTTP, so there is nothing to compare "
-                "against a service's unclaimed page"
+                "against a service's unclaimed page "
+                f"({result.error or 'no response'})"
             )
             return verdict
 
-        body = response.text
+        response = result.response
+        body = result.text
 
         # --- signal 1 + 2: delegation and the service's unclaimed page ----
         signature = match_service(cname, body)
@@ -245,13 +239,16 @@ class TakeoverVerifier:
         verdict.service = signature.service
         verdict.severity = signature.severity
         verdict.signals.extend(["cname_delegation", "unclaimed_service_page"])
-        verdict.evidence.append(
-            {
-                "label": "unclaimed service page",
-                "request_url": f"https://{host}/",
-                "response_status": response.status,
-                "note": f"CNAME -> {cname}; matched {signature.service}",
-            }
+        verdict.add(
+            Evidence.comparison(
+                "unclaimed service page",
+                payload=result.request,
+                roles=("observed", "control"),
+                note=f"CNAME -> {cname}; matched {signature.service}",
+                snippet=body[:2000],
+                matched_service=signature.service,
+                response_status=response.status,
+            )
         )
 
         # --- signal 3: is the delegation actually dangling? ---------------
@@ -305,10 +302,11 @@ class TakeoverVerifier:
             verdict.reason += f". {signature.note}"
         return verdict
 
-    async def _fetch(self, host: str):
+    async def _reach(self, host: str):
+        """Try HTTPS then HTTP, returning the first answer or the last failure."""
+        last = None
         for scheme in ("https", "http"):
-            try:
-                return await self._http.get(f"{scheme}://{host}/")
-            except Exception:
-                continue
-        return None
+            last = await self.fetch(PreparedRequest(url=f"{scheme}://{host}/"))
+            if last.ok:
+                return last
+        return last

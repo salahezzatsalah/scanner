@@ -30,7 +30,7 @@ from reconx.db.models import Endpoint
 from reconx.db.store import upsert_endpoint
 from reconx.stages.base import Stage, StageContext, StageResult
 from reconx.stages.wordlists import COMMON_PARAMETER_NAMES, load_wordlist
-from reconx.verify.sqli import set_parameter
+from reconx.verify.base import set_parameter, try_fetch
 from reconx.verify.waf import WafState, classify_response
 
 __all__ = ["ParamStage"]
@@ -201,7 +201,5 @@ class ParamStage(Stage):
     # -- transport ---------------------------------------------------------
 
     async def _get(self, ctx: StageContext, url: str):
-        try:
-            return await ctx.http.get(url)
-        except Exception:
-            return None
+        result = await try_fetch(ctx.http, url)
+        return result.response

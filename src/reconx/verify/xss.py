@@ -28,13 +28,19 @@ from __future__ import annotations
 
 import re
 import secrets
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import StrEnum
 
 from reconx.db.models import FindingTier
+from reconx.verify.base import (
+    Evidence,
+    OracleResult,
+    OracleStrength,
+    ParameterVerdict,
+    ParameterVerifier,
+    ParamTarget,
+)
 from reconx.verify.reproduce import reproduce
-from reconx.verify.sqli import set_parameter
-from reconx.verify.waf import WafState, classify_response
 
 __all__ = [
     "ReflectionKind",
@@ -179,37 +185,21 @@ class ReflectionSite:
 
 
 @dataclass
-class XssVerdict:
-    url: str
-    parameter: str
-    tier: FindingTier
-    confidence: int
+class XssVerdict(ParameterVerdict):
     site: ReflectionSite | None = None
     dom_confirmed: bool = False
     dom_available: bool = False
-    reason: str = ""
-    evidence: list[dict] = field(default_factory=list)
-    obstructed: bool = False
     reproduced: str = ""
-
-    @property
-    def vulnerable(self) -> bool:
-        return self.tier in (FindingTier.CONFIRMED, FindingTier.PROBABLE)
 
     def as_dict(self) -> dict:
         return {
-            "url": self.url,
-            "parameter": self.parameter,
-            "tier": self.tier.value,
-            "confidence": self.confidence,
+            **super().as_dict(),
             "context": self.site.kind.value if self.site else "none",
             "escapable": self.site.escapable if self.site else False,
             "surviving_chars": list(self.site.surviving_chars) if self.site else [],
             "encoded_chars": list(self.site.encoded_chars) if self.site else [],
             "dom_confirmed": self.dom_confirmed,
             "dom_available": self.dom_available,
-            "reason": self.reason,
-            "obstructed": self.obstructed,
         }
 
 
@@ -287,8 +277,12 @@ def _enclosing_quote(text: str) -> str | None:
     return in_quote
 
 
-class XssVerifier:
+class XssVerifier(ParameterVerifier):
     """Verifies reflected XSS by context analysis and, where possible, execution."""
+
+    vuln_class = "xss"
+    title = "Reflected cross-site scripting"
+    verdict_class = XssVerdict
 
     def __init__(
         self,
@@ -299,113 +293,200 @@ class XssVerifier:
         headless_confirm: bool = True,
         chromium_path: str = "",
     ) -> None:
-        self._http = http
-        self._attempts = attempts
-        self._required = required
+        super().__init__(http, attempts=attempts, required=required)
         self._headless_confirm = headless_confirm
         self._chromium_path = chromium_path
 
     # -- entry point -------------------------------------------------------
 
-    async def verify(self, url: str, parameter: str) -> XssVerdict:
-        verdict = XssVerdict(
-            url=url, parameter=parameter, tier=FindingTier.DISCARDED, confidence=0
-        )
+    async def verify(
+        self, target: ParamTarget | str, parameter: str | None = None
+    ) -> XssVerdict:
+        target = self.target_of(target, parameter)
+        verdict: XssVerdict = self.new_verdict(target)  # type: ignore[assignment]
 
         canary = f"rx{secrets.token_hex(5)}zz"
-        probe_url = set_parameter(url, parameter, canary)
-
-        response = await self._get(probe_url)
-        if response is None:
-            verdict.reason = "the probe request could not be completed"
+        result = await self.fetch(target.apply(canary))
+        if not result.ok:
+            verdict.reason = f"the probe request could not be completed ({result.error})"
             return verdict
 
-        obstruction = classify_response(
-            status=response.status, headers=response.headers, body=response.body
-        )
-        if obstruction.state is not WafState.CLEAN:
-            verdict.obstructed = True
-            verdict.tier = FindingTier.NEEDS_REVIEW
-            verdict.reason = (
-                f"the host was {obstruction.state.value} during testing, so this "
-                "result is not trustworthy; re-test when it is responsive"
-            )
+        if self.gate_obstruction(verdict, result):
             return verdict
 
         # --- step 1: is it reflected at all? ------------------------------
-        site = classify_reflection(response.text, canary)
+        site = classify_reflection(result.text, canary)
         verdict.site = site
         if site.kind is ReflectionKind.NONE:
-            verdict.reason = "the value is not reflected in the response"
+            verdict.oracles.append(
+                OracleResult(
+                    name="reflection",
+                    agreed=False,
+                    reason="the value is not reflected in the response",
+                )
+            )
+            self._decide(verdict)
             return verdict
 
         # Reflection must be reliable, not a one-off from a cache or a log view.
         async def reflection_probe(_index: int) -> tuple[bool, str | None]:
             fresh = f"rx{secrets.token_hex(5)}zz"
-            again = await self._get(set_parameter(url, parameter, fresh))
-            if again is None:
-                return False, "request failed"
+            again = await self.fetch(target.apply(fresh))
+            if not again.ok:
+                return False, f"request failed ({again.error})"
             return (fresh in again.text), None
 
         outcome = await reproduce(
             reflection_probe, attempts=self._attempts, required=self._required
         )
         verdict.reproduced = outcome.explain()
+        verdict.oracles.append(
+            OracleResult(
+                name="reflection",
+                agreed=outcome.stable,
+                reason=(
+                    f"{site.describe()}, {outcome.explain()}"
+                    if outcome.stable
+                    else f"reflection is not reliable: {outcome.explain()}"
+                ),
+                reproduced=outcome.successes,
+                attempts=outcome.total,
+            )
+        )
         if not outcome.stable:
-            verdict.reason = f"reflection is not reliable: {outcome.explain()}"
+            self._decide(verdict)
             return verdict
 
         # --- step 2: do the characters needed to escape survive? ----------
-        await self._probe_escaping(url, parameter, site)
+        await self._probe_escaping(target, site)
+
+        verdict.oracles.append(
+            OracleResult(
+                name="context_escape",
+                agreed=site.escapable,
+                reason=(
+                    f"every character needed to escape {site.kind.value} survives "
+                    f"unencoded ({', '.join(repr(c) for c in site.surviving_chars)})"
+                    if site.escapable
+                    else (
+                        f"{', '.join(repr(c) for c in site.encoded_chars) or 'the required characters'}"
+                        " are encoded or stripped"
+                    )
+                ),
+                detail={"context": site.kind.value},
+            )
+        )
 
         if not site.escapable:
-            verdict.reason = (
-                f"{site.describe()}, but "
-                f"{', '.join(repr(c) for c in site.encoded_chars) or 'the required characters'} "
-                "are encoded or stripped, so the reflection cannot break out of its "
-                "context and is inert"
+            verdict.add(
+                Evidence(
+                    label="inert reflection",
+                    context=site.kind.value,
+                    snippet=site.snippet,
+                    detail={"encoded_chars": list(site.encoded_chars)},
+                )
             )
-            verdict.evidence.append(
-                {"label": "inert reflection", "context": site.kind.value,
-                 "snippet": site.snippet}
-            )
+            self._decide(verdict)
             return verdict
 
         payload = site.payload_template.format(fn=MARKER_FUNCTION)
-        payload_url = set_parameter(url, parameter, payload)
-        verdict.evidence.append(
-            {
-                "label": "escapable reflection",
-                "context": site.kind.value,
-                "payload_url": payload_url,
-                "snippet": site.snippet,
-                "surviving_chars": list(site.surviving_chars),
-            }
+        payload_request = target.apply(payload)
+        verdict.add(
+            Evidence.comparison(
+                "escapable reflection",
+                payload=payload_request,
+                context=site.kind.value,
+                snippet=site.snippet,
+                surviving_chars=list(site.surviving_chars),
+            )
         )
 
         # --- step 3: does it actually execute? ----------------------------
         if self._headless_confirm:
-            confirmed, detail, available = await self._confirm_execution(payload_url)
+            confirmed, detail, available = await self._confirm_execution(
+                payload_request.url
+            )
             verdict.dom_available = available
             verdict.dom_confirmed = confirmed
-            if confirmed:
-                verdict.tier = FindingTier.CONFIRMED
-                verdict.confidence = 95
-                verdict.reason = (
-                    f"{site.describe()}, the characters needed to escape it survive, and "
-                    f"the payload executed in a real browser ({detail})"
+            verdict.oracles.append(
+                OracleResult(
+                    name="browser_execution",
+                    agreed=confirmed,
+                    reason=detail,
+                    strength=OracleStrength.DECISIVE,
                 )
-                return verdict
-            if available:
-                verdict.tier = FindingTier.NEEDS_REVIEW
-                verdict.confidence = 45
-                verdict.reason = (
-                    f"{site.describe()} and the escape characters survive, but the "
-                    f"payload did not execute in a real browser ({detail}). Something "
-                    "else is preventing it, such as a Content-Security-Policy"
-                )
-                return verdict
+            )
 
+        self._decide(verdict)
+        return verdict
+
+    # -- decision ----------------------------------------------------------
+
+    def _decide(self, verdict: XssVerdict) -> None:
+        """Turn the three steps into a tier.
+
+        XSS does not use :func:`~reconx.verify.base.decide_from_oracles`, because
+        its oracles are not independent: each one gates the next. Reflection is a
+        precondition for escape analysis, and escape analysis is a precondition
+        for execution. Counting them as agreeing votes would let two views of the
+        same fact reach Confirmed, which is exactly the mistake the two-oracle
+        rule exists to prevent.
+
+        So the ladder is explicit. Only real execution in a browser confirms.
+        """
+        site = verdict.site
+        agreed = {oracle.name for oracle in verdict.oracles if oracle.agreed}
+        verdict.signals = sorted(agreed)
+
+        if site is None or site.kind is ReflectionKind.NONE:
+            verdict.tier = FindingTier.DISCARDED
+            verdict.confidence = 0
+            verdict.reason = "the value is not reflected in the response"
+            return
+
+        if "reflection" not in agreed:
+            verdict.tier = FindingTier.DISCARDED
+            verdict.confidence = 0
+            verdict.reason = f"reflection is not reliable: {verdict.reproduced}"
+            return
+
+        if not site.escapable:
+            verdict.tier = FindingTier.DISCARDED
+            verdict.confidence = 0
+            encoded = ", ".join(repr(c) for c in site.encoded_chars)
+            verdict.reason = (
+                f"{site.describe()}, but {encoded or 'the required characters'} are "
+                "encoded or stripped, so the reflection cannot break out of its "
+                "context and is inert"
+            )
+            return
+
+        execution = next(
+            (o for o in verdict.oracles if o.name == "browser_execution"), None
+        )
+        if execution is not None and execution.agreed:
+            verdict.tier = FindingTier.CONFIRMED
+            verdict.confidence = 95
+            verdict.reason = (
+                f"{site.describe()}, the characters needed to escape it survive, and "
+                f"the payload executed in a real browser ({execution.reason})"
+            )
+            return
+
+        if execution is not None and verdict.dom_available:
+            verdict.tier = FindingTier.NEEDS_REVIEW
+            verdict.confidence = 45
+            verdict.reason = (
+                f"{site.describe()} and the escape characters survive, but the payload "
+                f"did not execute in a real browser ({execution.reason}). Something "
+                "else is preventing it, such as a Content-Security-Policy"
+            )
+            return
+
+        # No browser was available, so the strongest claim the evidence supports
+        # is that the reflection *can* escape its context. That is Probable, not
+        # a finding: a missing browser must downgrade confidence, never lose a
+        # real bug and never invent one.
         verdict.tier = FindingTier.PROBABLE
         verdict.confidence = 70
         verdict.reason = (
@@ -414,11 +495,10 @@ class XssVerifier:
             "Execution was not confirmed because a headless browser is unavailable, so "
             "verify by hand before reporting"
         )
-        return verdict
 
     # -- escape analysis ---------------------------------------------------
 
-    async def _probe_escaping(self, url: str, parameter: str, site: ReflectionSite) -> None:
+    async def _probe_escaping(self, target: ParamTarget, site: ReflectionSite) -> None:
         """Send the characters that matter and record which come back intact."""
         if not site.required_chars:
             return
@@ -429,11 +509,11 @@ class XssVerifier:
         probe_value = marker + "".join(
             f"{character}{marker}" for character in site.required_chars
         )
-        response = await self._get(set_parameter(url, parameter, probe_value))
-        if response is None:
+        result = await self.fetch(target.apply(probe_value))
+        if not result.ok:
             return
 
-        text = response.text
+        text = result.text
         survived: list[str] = []
         encoded: list[str] = []
         for character in site.required_chars:
@@ -513,11 +593,3 @@ class XssVerifier:
         if fired:
             return False, fired[0], True
         return False, "the marker never ran", True
-
-    # -- transport ---------------------------------------------------------
-
-    async def _get(self, url: str):
-        try:
-            return await self._http.get(url)
-        except Exception:
-            return None
