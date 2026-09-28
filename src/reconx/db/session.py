@@ -11,6 +11,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -24,6 +25,7 @@ from reconx.config import Settings, get_settings
 
 __all__ = [
     "get_engine",
+    "sqlite_journal_mode",
     "get_session_factory",
     "session_scope",
     "init_db",
@@ -45,6 +47,36 @@ def _prepare_sqlite_path(url: str) -> None:
     Path(raw).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
 
 
+def _configure_sqlite(engine: AsyncEngine, *, file_backed: bool) -> None:
+    """Make SQLite usable by more than one writer.
+
+    In its default journal mode SQLite fails a concurrent write immediately with
+    "database is locked", which breaks stages that run in parallel. Two pragmas
+    fix it:
+
+    * **WAL** lets a writer proceed alongside readers and shrinks the window in
+      which a second writer is blocked at all. It needs a file, so it is skipped
+      for in-memory databases.
+    * **busy_timeout** makes a blocked writer wait for its turn instead of
+      raising. Without it, WAL alone still loses races.
+
+    ``synchronous=NORMAL`` is the recommended pairing with WAL: durable against
+    a process crash, and much faster than the default.
+    """
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _set_pragmas(dbapi_connection, _record):  # noqa: ANN001
+        cursor = dbapi_connection.cursor()
+        try:
+            if file_backed:
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA busy_timeout=15000")
+            cursor.execute("PRAGMA foreign_keys=ON")
+        finally:
+            cursor.close()
+
+
 def get_engine(settings: Settings | None = None, *, url: str | None = None) -> AsyncEngine:
     """Return the process-wide engine, creating it on first use."""
     global _engine, _session_factory
@@ -62,6 +94,8 @@ def get_engine(settings: Settings | None = None, *, url: str | None = None) -> A
         kwargs["connect_args"] = {"check_same_thread": False}
 
     engine = create_async_engine(resolved, **kwargs)
+    if resolved.startswith("sqlite"):
+        _configure_sqlite(engine, file_backed=":memory:" not in resolved)
     if url is None:
         _engine = engine
         _session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
@@ -102,6 +136,16 @@ async def init_db(settings: Settings | None = None, *, engine: AsyncEngine | Non
     target = engine or get_engine(settings)
     async with target.begin() as connection:
         await connection.run_sync(SQLModel.metadata.create_all)
+
+
+async def sqlite_journal_mode(engine: AsyncEngine) -> str | None:
+    """The journal mode actually in force. Used by tests and diagnostics."""
+    if not engine.url.drivername.startswith("sqlite"):
+        return None
+    async with engine.connect() as connection:
+        result = await connection.execute(text("PRAGMA journal_mode"))
+        row = result.first()
+    return str(row[0]).lower() if row else None
 
 
 async def dispose_engine() -> None:

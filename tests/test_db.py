@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from reconx.db.models import (
+    Asset,
     AssetKind,
     BaselineKind,
     Finding,
@@ -417,3 +418,54 @@ def test_migrations_match_the_models(tmp_path: Path) -> None:
         f"revision with 'alembic revision --autogenerate'.\n{combined}"
     )
     assert "No new upgrade operations detected" in combined
+
+
+# ---------------------------------------------------------------------------
+# concurrent writers
+# ---------------------------------------------------------------------------
+
+
+async def test_sqlite_uses_wal_so_parallel_stages_can_write(file_db) -> None:
+    """Regression: parallel stages hit "database is locked" and one of them died.
+
+    SQLite's default journal mode refuses a concurrent write immediately rather
+    than waiting, so the port stage failed whenever it ran alongside content
+    discovery. WAL plus a busy timeout is the fix.
+    """
+    from reconx.db.session import get_engine, sqlite_journal_mode
+
+    engine = get_engine()
+    assert await sqlite_journal_mode(engine) == "wal"
+
+
+async def test_two_sessions_can_write_at_once(file_db) -> None:
+    """The actual failure mode, reproduced directly."""
+    import asyncio
+
+    from reconx.db.session import get_session_factory
+    from reconx.db.store import record_observation, upsert_asset, upsert_program
+    from tests.conftest import make_scope
+
+    factory = get_session_factory()
+    async with factory() as session:
+        program = await upsert_program(session, make_scope(), scope_yaml="program: x")
+        await session.commit()
+        program_id = program.id
+
+    async def writer(tag: str, count: int) -> None:
+        async with factory() as session:
+            for index in range(count):
+                await upsert_asset(
+                    session, program_id, f"{tag}{index}.example.com", sources=[tag]
+                )
+                await record_observation(
+                    session, program_id, kind="test", key=f"{tag}:{index}", value="v"
+                )
+            await session.commit()
+
+    # Two concurrent writers, which is exactly what a parallel stage level does.
+    await asyncio.gather(writer("a", 30), writer("b", 30))
+
+    async with factory() as session:
+        rows = (await session.execute(select(Asset))).scalars().all()
+    assert len(rows) == 60
