@@ -52,6 +52,9 @@ packages = ["src/reconx"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 filterwarnings = ["ignore::DeprecationWarning"]
+markers = [
+    "slow: spawns a subprocess or is otherwise slow (deselect with -m 'not slow')",
+]
 
 [tool.ruff]
 line-length = 100

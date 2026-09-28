@@ -8,6 +8,7 @@ as a stop-the-line event, never as a test to relax.
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from reconx.scope.guard import OutOfScopeError, ScopeGuard
 from reconx.scope.model import (
@@ -263,12 +264,12 @@ def test_program_limits_override_defaults() -> None:
 
 
 def test_authorization_block_is_required() -> None:
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         Scope.model_validate({"program": "x", "in_scope": ["example.com"]})
 
 
 def test_blank_attestation_is_rejected() -> None:
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         make_scope(authorization={
             "authorized_by": "me@example.com",
             "date": "2026-09-28",
@@ -277,7 +278,7 @@ def test_blank_attestation_is_rejected() -> None:
 
 
 def test_empty_in_scope_is_rejected() -> None:
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         make_scope(in_scope=[])
 
 
