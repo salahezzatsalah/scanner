@@ -134,16 +134,35 @@ out of scope, which makes it usable in a script.
 ### 3. Run it continuously
 
 ```bash
-reconx serve            # worker + scheduler + API in one local process
+reconx monitor enable acme        # create the default schedule
+reconx monitor status acme        # what runs when, and when it next fires
+reconx monitor cadence acme resolve_probe 30m   # tune any stage
+reconx monitor tick               # run one cycle now, to check your setup
+reconx serve                      # run continuously in the foreground
 ```
 
-Cadences are per program and per stage (liveness hourly, subdomain enumeration daily, full vuln
-sweep weekly — all configurable). The diff engine watches for **new subdomain, new open port, new
-endpoint, new finding** and notifies you. On a wildcard program, being first to see a new asset is
-the highest-value thing this tool does for you.
+Each stage has its own cadence, because different things change at different speeds:
 
-Set any of `RECONX_DISCORD_WEBHOOK`, `RECONX_SLACK_WEBHOOK`, `RECONX_TELEGRAM_BOT_TOKEN`, or
-`RECONX_GENERIC_WEBHOOK` in `.env` to get alerts.
+| Stage | Default | Why |
+|---|---|---|
+| `resolve_probe` | hourly | liveness and titles change fast |
+| `subdomains` | daily | **a new host is the highest-value signal on a wildcard program** |
+| `content` | daily | new endpoints appear with deploys |
+| `passive_recon` | weekly | registration data moves slowly |
+| `params` | weekly | |
+| `vulns` | weekly | the most expensive pass |
+
+The diff engine watches for new hosts, hosts that start or stop answering, notable new endpoints,
+and new findings, then sends one message with findings first. **It stays silent when nothing
+changed** — a monitor that pings you hourly regardless gets muted, and then it is useless.
+
+Set any of `RECONX_DISCORD_WEBHOOK`, `RECONX_SLACK_WEBHOOK`, `RECONX_TELEGRAM_BOT_TOKEN` plus
+`RECONX_TELEGRAM_CHAT_ID`, or `RECONX_GENERIC_WEBHOOK` in `.env`. The generic webhook posts
+structured JSON, so it can feed a dashboard rather than only a chat window.
+
+Alerts carry hostnames, URLs and finding titles, so point them at a channel only you can read.
+The schedule lives in the database: stopping and restarting `reconx serve` picks up where it left
+off, and only one scan runs per program at a time so the scope's rate limits still hold.
 
 ---
 

@@ -125,13 +125,20 @@ def test_no_module_reaches_the_network_around_the_guard() -> None:
     scoped wrappers. If this fails, someone added a code path that can send
     traffic without a scope check — fix the code, never this test.
     """
+    # ReconX has exactly three outbound channels, each constrained differently:
+    #
+    #   net/http.py     target traffic, gated by the program scope
+    #   net/sources.py  public intelligence services, gated by a code-defined
+    #                   allowlist (test_source_client_* below)
+    #   notify/base.py  alerts to endpoints the operator configured, which are
+    #                   never derived from scan data (test_notifier_* below)
+    #
+    # Anything else constructing a client is an unreviewed fourth channel.
     allowed = {
-        # sources.py is the second constrained channel: it reaches public
-        # intelligence services only, gated by a code-defined allowlist rather
-        # than by the program scope. test_source_client_* below pins that down.
         "httpx.AsyncClient": {
             Path("src/reconx/net/http.py"),
             Path("src/reconx/net/sources.py"),
+            Path("src/reconx/notify/base.py"),
         },
         "dns.asyncresolver.Resolver": {Path("src/reconx/net/dns.py")},
         "dns.resolver.Resolver": {Path("src/reconx/net/dns.py")},

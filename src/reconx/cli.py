@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC
 from pathlib import Path
 from typing import Annotated
 
@@ -45,12 +46,16 @@ scope_app = typer.Typer(no_args_is_help=True, help="Define and check program sco
 scan_app = typer.Typer(no_args_is_help=True, help="Run the pipeline.")
 assets_app = typer.Typer(no_args_is_help=True, help="Inspect discovered assets.")
 findings_app = typer.Typer(no_args_is_help=True, help="Inspect findings.")
+monitor_app = typer.Typer(
+    no_args_is_help=True, help="Continuous monitoring and alerts."
+)
 db_app = typer.Typer(no_args_is_help=True, help="Database maintenance.")
 
 app.add_typer(scope_app, name="scope")
 app.add_typer(scan_app, name="scan")
 app.add_typer(assets_app, name="assets")
 app.add_typer(findings_app, name="findings")
+app.add_typer(monitor_app, name="monitor")
 app.add_typer(db_app, name="db")
 
 
@@ -751,6 +756,327 @@ def report(
             console.print(text, markup=False, highlight=False)
 
     asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# monitor
+# ---------------------------------------------------------------------------
+
+
+@monitor_app.command("status")
+def monitor_status(
+    program: Annotated[
+        str | None, typer.Argument(help="Program slug, or omit for all programs")
+    ] = None,
+) -> None:
+    """Show the monitoring schedule and when each stage next runs."""
+
+    async def run() -> None:
+        from datetime import datetime
+
+        from reconx.db.models import ScheduleEntry
+        from reconx.monitor.scheduler import DEFAULT_CADENCES
+        from reconx.notify.base import build_notifiers
+
+        await init_db()
+        factory = get_session_factory()
+        async with factory() as session:
+            programs = await list_programs(session)
+            if program:
+                programs = [p for p in programs if p.slug == program]
+                if not programs:
+                    err_console.print(f"[red]No program named {program!r}[/red]")
+                    raise typer.Exit(code=2)
+            if not programs:
+                console.print("No programs stored yet.")
+                return
+
+            now = datetime.now(UTC)
+            for found in programs:
+                entries = (
+                    await session.execute(
+                        select(ScheduleEntry)
+                        .where(ScheduleEntry.program_id == found.id)
+                        .order_by(ScheduleEntry.stage)
+                    )
+                ).scalars().all()
+
+                state = "[green]on[/green]" if found.monitoring_enabled else "[yellow]off[/yellow]"
+                table = Table(title=f"{found.name} — monitoring {state}")
+                table.add_column("Stage", style="bold")
+                table.add_column("Every")
+                table.add_column("Last run")
+                table.add_column("Next run")
+                table.add_column("Status")
+
+                if not entries:
+                    for stage, interval in DEFAULT_CADENCES.items():
+                        table.add_row(
+                            stage, _humanize(interval), "-",
+                            "[dim]not scheduled yet[/dim]", "-",
+                        )
+                for entry in entries:
+                    next_run = entry.next_run_at
+                    if next_run is not None and next_run.tzinfo is None:
+                        next_run = next_run.replace(tzinfo=UTC)
+                    if next_run is None:
+                        due = "as soon as the service runs"
+                    elif next_run <= now:
+                        due = "[green]due now[/green]"
+                    else:
+                        due = f"in {_humanize(int((next_run - now).total_seconds()))}"
+                    table.add_row(
+                        entry.stage,
+                        _humanize(entry.interval_seconds),
+                        entry.last_run_at.strftime("%Y-%m-%d %H:%M") if entry.last_run_at else "-",
+                        due,
+                        (entry.last_status.value if entry.last_status else "-")
+                        + (
+                            f" ({entry.consecutive_failures} fails)"
+                            if entry.consecutive_failures
+                            else ""
+                        ),
+                    )
+                console.print(table)
+
+        hub = build_notifiers()
+        if hub.enabled:
+            console.print(f"\nAlerts go to: [bold]{', '.join(hub.channels)}[/bold]")
+        else:
+            console.print(
+                "\n[yellow]No alert channel configured.[/yellow] Monitoring will still "
+                "run and record findings, but nothing will reach you. Set "
+                "RECONX_DISCORD_WEBHOOK, RECONX_SLACK_WEBHOOK, "
+                "RECONX_TELEGRAM_BOT_TOKEN or RECONX_GENERIC_WEBHOOK in .env"
+            )
+
+    asyncio.run(run())
+
+
+def _humanize(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
+
+
+@monitor_app.command("enable")
+def monitor_enable(
+    program: Annotated[str, typer.Argument(help="Program slug")],
+) -> None:
+    """Turn on continuous monitoring and create the default schedule."""
+    _set_monitoring(program, True)
+
+
+@monitor_app.command("disable")
+def monitor_disable(
+    program: Annotated[str, typer.Argument(help="Program slug")],
+) -> None:
+    """Turn off continuous monitoring. Stored data is kept."""
+    _set_monitoring(program, False)
+
+
+def _set_monitoring(program: str, enabled: bool) -> None:
+    async def run() -> None:
+        from reconx.monitor.scheduler import MonitorService
+
+        await init_db()
+        factory = get_session_factory()
+        async with factory() as session:
+            found = await get_program(session, program)
+            if found is None:
+                err_console.print(f"[red]No program named {program!r}[/red]")
+                raise typer.Exit(code=2)
+            found.monitoring_enabled = enabled
+            session.add(found)
+            await session.commit()
+            target = found
+
+        if enabled:
+            service = MonitorService()
+            entries = await service.ensure_schedules(target)
+            console.print(
+                f"[green]Monitoring on[/green] for [bold]{target.name}[/bold] "
+                f"({len(entries)} stage schedules)"
+            )
+            console.print(
+                "Start the service with [bold]reconx serve[/bold], then check "
+                f"[bold]reconx monitor status {target.slug}[/bold]"
+            )
+        else:
+            console.print(f"[yellow]Monitoring off[/yellow] for {target.name}")
+
+    asyncio.run(run())
+
+
+@monitor_app.command("cadence")
+def monitor_cadence(
+    program: Annotated[str, typer.Argument(help="Program slug")],
+    stage: Annotated[str, typer.Argument(help="Stage name")],
+    interval: Annotated[
+        str, typer.Argument(help="Interval, e.g. 30m, 6h, 2d")
+    ],
+) -> None:
+    """Change how often one stage runs for one program."""
+
+    async def run() -> None:
+        from reconx.db.store import upsert_schedule_entry
+
+        seconds = _parse_interval(interval)
+        if stage not in STAGE_REGISTRY:
+            err_console.print(
+                f"[red]Unknown stage {stage!r}.[/red] Stages: "
+                + ", ".join(sorted(STAGE_REGISTRY))
+            )
+            raise typer.Exit(code=2)
+
+        await init_db()
+        factory = get_session_factory()
+        async with factory() as session:
+            found = await get_program(session, program)
+            if found is None:
+                err_console.print(f"[red]No program named {program!r}[/red]")
+                raise typer.Exit(code=2)
+            await upsert_schedule_entry(
+                session, found.id, stage, interval_seconds=seconds
+            )
+            await session.commit()
+        console.print(
+            f"[green]{stage}[/green] will run every [bold]{_humanize(seconds)}[/bold] "
+            f"for {program}"
+        )
+
+    asyncio.run(run())
+
+
+def _parse_interval(text: str) -> int:
+    raw = text.strip().lower()
+    multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+    if raw and raw[-1] in multipliers:
+        try:
+            return max(60, int(float(raw[:-1]) * multipliers[raw[-1]]))
+        except ValueError:
+            pass
+    try:
+        return max(60, int(raw))
+    except ValueError as exc:
+        err_console.print(
+            f"[red]Could not read interval {text!r}.[/red] Use forms like 30m, 6h, 2d."
+        )
+        raise typer.Exit(code=2) from exc
+
+
+@monitor_app.command("tick")
+def monitor_tick(
+    no_external_tools: Annotated[
+        bool, typer.Option("--no-external-tools", help="Use only the built-in paths")
+    ] = False,
+) -> None:
+    """Run one monitoring cycle now, then exit. Useful for checking setup."""
+
+    async def run() -> None:
+        from reconx.monitor.scheduler import MonitorService
+
+        await init_db()
+        service = MonitorService(use_external_tools=not no_external_tools)
+        console.print("Running one monitoring cycle...")
+        report = await service.tick()
+
+        if report.idle:
+            console.print("[dim]Nothing was due.[/dim]")
+        else:
+            for slug in report.programs_run:
+                console.print(
+                    f"[green]{slug}[/green]: ran "
+                    f"{', '.join(report.stages_run.get(slug, []))}"
+                )
+            console.print(
+                f"\nChanges detected: {report.changes_found}   "
+                f"Notifications sent: {report.notifications_sent}"
+            )
+        for slug in report.skipped_busy:
+            console.print(f"[yellow]{slug}: a scan was already running[/yellow]")
+        for slug, error in report.errors.items():
+            err_console.print(f"[red]{slug}: {error}[/red]")
+
+    asyncio.run(run())
+
+
+@app.command()
+def serve(
+    tick: Annotated[
+        int, typer.Option("--tick", help="Seconds between checks for due work")
+    ] = 60,
+    no_external_tools: Annotated[
+        bool, typer.Option("--no-external-tools", help="Use only the built-in paths")
+    ] = False,
+) -> None:
+    """Run continuously: check for due work, scan, and alert on what changed.
+
+    Runs in the foreground. Stop it with Ctrl-C; the schedule lives in the
+    database, so restarting picks up where it left off.
+    """
+
+    async def run() -> None:
+        from reconx.monitor.scheduler import MonitorService
+
+        settings = get_settings()
+        settings.ensure_dirs()
+        await init_db()
+
+        factory = get_session_factory()
+        async with factory() as session:
+            programs = [p for p in await list_programs(session) if p.monitoring_enabled]
+
+        service = MonitorService(
+            tick_seconds=tick, use_external_tools=not no_external_tools
+        )
+        for found in programs:
+            await service.ensure_schedules(found)
+
+        console.print(
+            Panel(
+                f"monitoring {len(programs)} program(s): "
+                f"{', '.join(p.slug for p in programs) or 'none'}\n"
+                f"checking for due work every {tick}s\n"
+                f"alerts: {', '.join(service.notifier_channels) or 'none configured'}\n"
+                f"database: {settings.database_url}",
+                title="ReconX running",
+                border_style="cyan",
+            )
+        )
+        if not programs:
+            console.print(
+                "[yellow]No program has monitoring enabled.[/yellow] Turn one on with "
+                "[bold]reconx monitor enable <slug>[/bold]"
+            )
+        console.print("[dim]Ctrl-C to stop.[/dim]\n")
+
+        await service.start()
+        try:
+            while True:
+                await asyncio.sleep(60)
+                report = service.last_report
+                if report is not None and not report.idle:
+                    console.print(
+                        f"[dim]{report.started:%H:%M:%S}[/dim] ran "
+                        f"{', '.join(report.programs_run)} · "
+                        f"{report.changes_found} change(s) · "
+                        f"{report.notifications_sent} alert(s)"
+                    )
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            pass
+        finally:
+            await service.stop()
+            console.print("\n[green]Stopped.[/green] The schedule is saved.")
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        console.print("\n[green]Stopped.[/green]")
 
 
 # ---------------------------------------------------------------------------
