@@ -32,6 +32,7 @@ from reconx.db.store import add_evidence, upsert_finding
 from reconx.report.repro import curl_command
 from reconx.stages.base import Stage, StageContext, StageResult
 from reconx.tools.base import ToolNotAvailable
+from reconx.triage.priority import compute_priority
 from reconx.verify.baseline import BaselineCollector
 from reconx.verify.reproduce import reproduce
 from reconx.verify.sqli import SqliVerifier
@@ -504,6 +505,20 @@ class VulnStage(Stage):
             tested_while_throttled=obstructed,
             recommendation=recommendation,
         )
+
+        # Order the queue by more than severity: confidence, verification tier
+        # and what the affected host looks like all matter.
+        asset = None
+        if finding.asset_id is not None:
+            asset = (
+                await ctx.session.execute(
+                    select(Asset).where(Asset.id == finding.asset_id)
+                )
+            ).scalars().first()
+        breakdown = compute_priority(finding, asset=asset)
+        finding.priority = breakdown.priority
+        ctx.session.add(finding)
+        await ctx.session.flush()
 
         for item in evidence or []:
             request_url = item.get("request_url") or item.get("payload_url") or item.get(

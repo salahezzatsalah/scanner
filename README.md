@@ -124,7 +124,14 @@ reconx scan history acme
 reconx assets list acme --live
 reconx findings list acme --tier confirmed
 reconx findings list acme --tier discarded   # audit what the filter rejected
+
+reconx next acme                  # what to do next, ordered, with reasoning
+reconx triage rescore acme        # recompute priority for every finding
+
 reconx report acme -o report.md
+reconx report acme -f html -o report.html    # standalone, no external requests
+reconx report acme -f json -o report.json    # for archiving or diffing
+reconx api                        # HTTP API on 127.0.0.1:8000, docs at /docs
 ```
 
 `scope validate` and `scope test` send no traffic at all, so you can check a
@@ -186,21 +193,43 @@ These are structural, not advisory:
 ## Architecture
 
 ```
-scope.yaml → ScopeGuard → Orchestrator (asyncio DAG, resumable, rate limited)
-   ├─ passive recon ... WHOIS/RDAP, DNS, cert transparency, ASN
-   ├─ subdomains ...... passive + brute + permutations → wildcard-DNS filter
-   ├─ resolve/probe ... dnsx + httpx → dedupe by response fingerprint
-   ├─ ports ........... naabu
-   ├─ content ......... katana, historical URLs, JS parsing, ffuf → soft-404 filter
-   ├─ params .......... parameter mining + reflection map
-   └─ vulns ........... nuclei, SQLi/XSS candidates, takeover
+scope.yaml → ScopeGuard → Orchestrator (dependency-ordered, parallel, resumable)
+   ├─ passive_recon ... RDAP registration, DNS records, IP and ASN attribution
+   ├─ subdomains ...... passive sources + brute + permutations → wildcard filter
+   ├─ resolve_probe ... liveness, tech, TLS → group identical responses
+   ├─ ports ........... naabu or a connect scan → exposed-service findings
+   ├─ content ......... robots/sitemap, crawl, archives, JS mining → soft-404 filter
+   ├─ params .......... parameter discovery + reflection map
+   └─ vulns ........... nuclei, SQLi, XSS, takeover
                               ↓
                       VERIFICATION ENGINE
+              baseline · WAF state · reproducibility
+              differential · two-oracle SQLi · DOM XSS
                               ↓
-        Triage + recommendations · diff engine · alerts · reports
+   Confirmed / Probable / Needs review / Discarded (with the reason)
+                              ↓
+   priority scoring · next actions · diff engine · alerts · reports · API
 ```
 
-See `src/reconx/` for the module layout and `docs/` for details.
+Three outbound channels, each constrained differently:
+
+| Channel | What it reaches | What constrains it |
+|---|---|---|
+| `net/http.py` | the target | the program scope, re-checked on every redirect |
+| `net/sources.py` | public data services | a code-defined allowlist, immutable at runtime |
+| `notify/base.py` | your alert endpoint | read from settings, never from scan data |
+
+A test scans the source tree and fails if any other module opens a client.
+
+### What to do next
+
+`reconx next acme` is the part that turns data into a plan. It orders findings
+with their escalation steps, points at interesting hosts that have produced
+nothing yet, and — most usefully — names the **coverage gaps**: endpoints whose
+parameters were found but never tested, hosts discovered but never explored,
+stages that have not run in days. A researcher staring at an empty findings list
+has nowhere to go; one who knows twenty-three hosts were never content-scanned
+does.
 
 ## Development
 

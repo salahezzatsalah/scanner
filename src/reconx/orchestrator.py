@@ -40,6 +40,7 @@ from reconx.stages.base import Stage, StageContext, StageResult
 from reconx.stages.content import ContentStage
 from reconx.stages.params import ParamStage
 from reconx.stages.passive_recon import PassiveReconStage
+from reconx.stages.ports import PortStage
 from reconx.stages.resolve_probe import ResolveProbeStage
 from reconx.stages.subdomains import SubdomainStage
 from reconx.stages.vulns import VulnStage
@@ -64,6 +65,7 @@ STAGE_REGISTRY: dict[str, type[Stage]] = {
     SubdomainStage.name: SubdomainStage,
     ResolveProbeStage.name: ResolveProbeStage,
     ContentStage.name: ContentStage,
+    PortStage.name: PortStage,
     ParamStage.name: ParamStage,
     VulnStage.name: VulnStage,
 }
@@ -72,7 +74,7 @@ STAGE_REGISTRY: dict[str, type[Stage]] = {
 STAGE_GROUPS: dict[str, tuple[str, ...]] = {
     "recon": ("passive_recon", "subdomains", "resolve_probe"),
     "passive": ("passive_recon",),
-    "discover": ("passive_recon", "subdomains", "resolve_probe", "content"),
+    "discover": ("passive_recon", "subdomains", "resolve_probe", "content", "ports"),
     "vulns": ("vulns",),
     "all": tuple(STAGE_REGISTRY),
     "full": tuple(STAGE_REGISTRY),

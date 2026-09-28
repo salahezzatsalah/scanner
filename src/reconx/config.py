@@ -59,6 +59,9 @@ class Settings(BaseSettings):
     # --- api --------------------------------------------------------------
     api_host: str = "127.0.0.1"
     api_port: int = 8000
+    # Required before the API may bind to anything but loopback, because it
+    # serves findings. See reconx.api.app.assert_safe_binding.
+    api_token: str = ""
 
     # --- optional passive-source api keys ---------------------------------
     shodan_api_key: str = ""

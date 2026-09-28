@@ -46,6 +46,9 @@ scope_app = typer.Typer(no_args_is_help=True, help="Define and check program sco
 scan_app = typer.Typer(no_args_is_help=True, help="Run the pipeline.")
 assets_app = typer.Typer(no_args_is_help=True, help="Inspect discovered assets.")
 findings_app = typer.Typer(no_args_is_help=True, help="Inspect findings.")
+triage_app = typer.Typer(
+    no_args_is_help=True, help="Scoring and triage maintenance."
+)
 monitor_app = typer.Typer(
     no_args_is_help=True, help="Continuous monitoring and alerts."
 )
@@ -55,6 +58,7 @@ app.add_typer(scope_app, name="scope")
 app.add_typer(scan_app, name="scan")
 app.add_typer(assets_app, name="assets")
 app.add_typer(findings_app, name="findings")
+app.add_typer(triage_app, name="triage")
 app.add_typer(monitor_app, name="monitor")
 app.add_typer(db_app, name="db")
 
@@ -729,31 +733,230 @@ def report(
     output: Annotated[
         str | None, typer.Option("--output", "-o", help="Write to a file instead of stdout")
     ] = None,
+    fmt: Annotated[
+        str, typer.Option("--format", "-f", help="markdown, html or json")
+    ] = "markdown",
     include_discarded: Annotated[
         bool,
-        typer.Option("--include-discarded", help="List findings verification filtered out"),
+        typer.Option(
+            "--include-discarded",
+            help="List the candidates verification rejected, and why",
+        ),
     ] = False,
 ) -> None:
-    """Generate a Markdown report."""
+    """Generate a report as Markdown, standalone HTML, or JSON."""
 
     async def run() -> None:
+        chosen = fmt.strip().lower()
+        if chosen not in {"markdown", "md", "html", "json"}:
+            err_console.print(
+                f"[red]Unknown format {fmt!r}.[/red] Use markdown, html or json."
+            )
+            raise typer.Exit(code=2)
+
         factory = get_session_factory()
         async with factory() as session:
             found = await get_program(session, program)
             if found is None:
                 err_console.print(f"[red]No program named {program!r}[/red]")
                 raise typer.Exit(code=2)
-            text = await build_markdown_report(
-                session, found, include_discarded=include_discarded
-            )
+
+            if chosen == "html":
+                from reconx.report.html import build_html_report
+
+                text = await build_html_report(
+                    session, found, include_discarded=True
+                )
+                suffix = ".html"
+            elif chosen == "json":
+                from reconx.report.json_export import dump_json_report
+
+                text = await dump_json_report(session, found, include_discarded=True)
+                suffix = ".json"
+            else:
+                text = await build_markdown_report(
+                    session, found, include_discarded=include_discarded
+                )
+                suffix = ".md"
 
         if output:
             path = Path(output)
+            if path.suffix == "":
+                path = path.with_suffix(suffix)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text, encoding="utf-8")
-            console.print(f"[green]Wrote[/green] {path} ({len(text)} bytes)")
+            console.print(f"[green]Wrote[/green] {path} ({len(text):,} bytes)")
         else:
             console.print(text, markup=False, highlight=False)
+
+    asyncio.run(run())
+
+
+@app.command()
+def api(
+    host: Annotated[
+        str | None, typer.Option("--host", help="Address to bind (default 127.0.0.1)")
+    ] = None,
+    port: Annotated[int | None, typer.Option("--port", help="Port to bind")] = None,
+    reload: Annotated[bool, typer.Option("--reload", help="Reload on code changes")] = False,
+) -> None:
+    """Serve the HTTP API.
+
+    Binds to loopback by default. It refuses to bind anywhere else without
+    RECONX_API_TOKEN set, because it serves findings.
+    """
+    import uvicorn
+
+    from reconx.api.app import ApiExposureError, assert_safe_binding, create_app
+
+    settings = get_settings()
+    bind_host = host or settings.api_host
+    bind_port = port or settings.api_port
+
+    try:
+        assert_safe_binding(bind_host, settings.api_token)
+    except ApiExposureError as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=2) from exc
+
+    settings.ensure_dirs()
+    console.print(
+        Panel(
+            f"http://{bind_host}:{bind_port}\n"
+            f"docs: http://{bind_host}:{bind_port}/docs\n"
+            f"auth: {'bearer token required' if settings.api_token else 'none (loopback only)'}\n"
+            f"database: {settings.database_url}",
+            title="ReconX API",
+            border_style="cyan",
+        )
+    )
+    uvicorn.run(
+        "reconx.api.app:create_app" if reload else create_app(settings),
+        host=bind_host,
+        port=bind_port,
+        factory=reload,
+        reload=reload,
+        log_level="info",
+    )
+
+
+# ---------------------------------------------------------------------------
+# next actions
+# ---------------------------------------------------------------------------
+
+
+@app.command("next")
+def next_actions(
+    program: Annotated[str, typer.Argument(help="Program slug")],
+    limit: Annotated[int, typer.Option("--limit", "-n")] = 15,
+    kind: Annotated[
+        str | None,
+        typer.Option("--kind", help="finding, asset, coverage, staleness or setup"),
+    ] = None,
+) -> None:
+    """What to do next, ordered, with the reasoning."""
+
+    async def run() -> None:
+        from reconx.triage.recommend import recommend
+
+        await init_db()
+        factory = get_session_factory()
+        async with factory() as session:
+            found = await get_program(session, program)
+            if found is None:
+                err_console.print(f"[red]No program named {program!r}[/red]")
+                raise typer.Exit(code=2)
+
+            statuses = await detect_all(ScopeGuard(load_scope_from_text(found.scope_yaml)))
+            actions = await recommend(
+                session, found, limit=limit * 3, tool_statuses=statuses
+            )
+
+        if kind:
+            actions = [item for item in actions if item.kind == kind]
+        actions = actions[:limit]
+
+        if not actions:
+            console.print("Nothing to suggest. Run a scan first.")
+            return
+
+        colours = {
+            "finding": "red",
+            "asset": "magenta",
+            "coverage": "yellow",
+            "staleness": "blue",
+            "setup": "cyan",
+        }
+        console.print(f"[bold]Next actions for {found.name}[/bold]\n")
+        for index, item in enumerate(actions, 1):
+            colour = colours.get(item.kind, "white")
+            console.print(
+                f"[bold]{index}.[/bold] [{colour}]({item.kind})[/{colour}] "
+                f"{item.subject}"
+            )
+            console.print(f"   [bold]Do:[/bold] {item.action}")
+            console.print(f"   [dim]Why: {item.why}[/dim]")
+            if item.command:
+                console.print(f"   [green]$ {item.command}[/green]")
+            console.print()
+
+    asyncio.run(run())
+
+
+@triage_app.command("rescore")
+def triage_rescore(
+    program: Annotated[str, typer.Argument(help="Program slug")],
+) -> None:
+    """Recompute priority for every stored finding.
+
+    Useful after upgrading, or after changing how much you care about a class of
+    asset. Scoring is deterministic, so this only ever changes the ordering.
+    """
+
+    async def run() -> None:
+        from reconx.db.models import Asset, Finding
+        from reconx.triage.priority import compute_priority, explain_priority
+
+        await init_db()
+        factory = get_session_factory()
+        async with factory() as session:
+            found = await get_program(session, program)
+            if found is None:
+                err_console.print(f"[red]No program named {program!r}[/red]")
+                raise typer.Exit(code=2)
+
+            assets = {
+                asset.host: asset
+                for asset in (
+                    await session.execute(
+                        select(Asset).where(Asset.program_id == found.id)
+                    )
+                ).scalars().all()
+            }
+            findings = (
+                await session.execute(
+                    select(Finding).where(Finding.program_id == found.id)
+                )
+            ).scalars().all()
+
+            changed = 0
+            top: list[tuple[float, str, str]] = []
+            for finding in findings:
+                host = (finding.affected_hosts or [""])[0]
+                breakdown = compute_priority(finding, asset=assets.get(host))
+                if abs(breakdown.priority - finding.priority) > 0.01:
+                    changed += 1
+                finding.priority = breakdown.priority
+                session.add(finding)
+                top.append((breakdown.priority, finding.title, explain_priority(breakdown)))
+            await session.commit()
+
+        console.print(
+            f"Rescored {len(findings)} finding(s); {changed} changed.\n"
+        )
+        for priority, title, why in sorted(top, reverse=True)[:8]:
+            console.print(f"  [bold]{priority:6.1f}[/bold]  {title[:60]}")
+            console.print(f"          [dim]{why}[/dim]")
 
     asyncio.run(run())
 
