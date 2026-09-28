@@ -426,6 +426,24 @@ def scan_run(
             ),
         ),
     ] = False,
+    no_registration: Annotated[
+        bool,
+        typer.Option(
+            "--no-registration",
+            help="Skip the check for self-registration that bypasses an SSO boundary",
+        ),
+    ] = False,
+    allow_account_creation: Annotated[
+        bool,
+        typer.Option(
+            "--allow-account-creation",
+            help=(
+                "Let ReconX register one account per host to prove a registration "
+                "bypass. Writes to the target, so it also requires "
+                "permissions.account_creation in the scope file"
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Run the pipeline against a program."""
 
@@ -453,8 +471,27 @@ def scan_run(
                 run_nuclei=not no_nuclei,
                 enable_timing=not no_timing,
                 headless_xss=not no_headless,
+                check_registration=not no_registration,
+                allow_account_creation=allow_account_creation,
             ),
         }
+
+        # Writing to a target is worth saying out loud before any traffic goes
+        # out, and worth refusing out loud when the scope has not allowed it.
+        write_line = ""
+        if allow_account_creation:
+            if scope.permissions.account_creation:
+                write_line = (
+                    "\n[yellow]account creation: ON[/yellow] — one account per host "
+                    f"under {scope.permissions.test_account_email}, to prove a "
+                    "registration bypass"
+                )
+            else:
+                write_line = (
+                    "\n[yellow]account creation requested but not granted[/yellow] — "
+                    "add permissions.account_creation to the scope file; registration "
+                    "will be looked for, never submitted"
+                )
 
         console.print(
             Panel(
@@ -463,7 +500,8 @@ def scan_run(
                 f"on {scope.authorization.date}\n"
                 f"in scope: {', '.join(r.raw for r in scope.in_scope_rules)}\n"
                 f"excluded: "
-                f"{', '.join(r.raw for r in scope.out_of_scope_rules) or 'nothing'}",
+                f"{', '.join(r.raw for r in scope.out_of_scope_rules) or 'nothing'}"
+                f"{write_line}",
                 title="Starting scan",
                 border_style="cyan",
             )

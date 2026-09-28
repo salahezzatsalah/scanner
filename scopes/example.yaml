@@ -44,6 +44,25 @@ out_of_scope:
   - "https://example.com/logout"
 
 # ---------------------------------------------------------------------------
+# What ReconX may do beyond looking. Everything here is off by default, because
+# each entry lets a check leave something behind on a target rather than only
+# read from it. A command-line flag is not enough on its own: the permission
+# lives here, next to the attestation that authorized the testing.
+#
+#   account_creation    lets the registration check create ONE account per host
+#                       to prove that self-registration crosses an SSO boundary.
+#                       Only turn this on if the program's rules permit creating
+#                       accounts, and expect to name the account in your report
+#                       and ask for it to be deleted.
+#   test_account_email  required with account_creation. A mailbox you control;
+#                       each account is created plus-addressed under it, so
+#                       everything ReconX made is attributable and findable.
+# ---------------------------------------------------------------------------
+permissions:
+  account_creation: false
+  # test_account_email: "you+reconx@example.com"
+
+# ---------------------------------------------------------------------------
 # Politeness. Program limits belong here and override global .env settings.
 # ---------------------------------------------------------------------------
 limits:

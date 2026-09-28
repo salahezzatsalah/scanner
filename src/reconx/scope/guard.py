@@ -229,6 +229,18 @@ class ScopeGuard:
         value = getattr(self._scope.limits, name, None)
         return default if value is None else value
 
+    # -- permissions ------------------------------------------------------
+
+    def permits(self, capability: str) -> bool:
+        """Has the scope granted a check that leaves something behind?
+
+        Read-only probing needs no permission beyond being in scope. Anything
+        that writes to a target — creating an account, for instance — is refused
+        unless the scope file says otherwise, so the authorization for it sits in
+        the same document as the attestation rather than in a shell history.
+        """
+        return bool(getattr(self._scope.permissions, capability, False))
+
     def __repr__(self) -> str:  # pragma: no cover - display only
         return (
             f"ScopeGuard(program={self._scope.program!r}, "

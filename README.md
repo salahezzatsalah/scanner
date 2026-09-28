@@ -33,6 +33,7 @@ layer none of them have — a verification pipeline:
 | **SQLi: two independent oracles** | Network jitter mistaken for time-based injection |
 | **XSS: context analysis + real DOM execution** | Reflected-but-inert input reported as XSS |
 | **WAF state gating** | Whole runs poisoned by block pages read as anomalies |
+| **Registration: SSO-boundary test** | Every consumer sign-up page called an auth bypass |
 | **Cross-asset correlation** | One issue spammed as 200 separate findings |
 | **Evidence or it isn't Confirmed** | Unreproducible findings that waste submissions |
 
@@ -120,6 +121,9 @@ reconx scan run acme --wordlist big.txt   # deeper brute force
 reconx scan run acme --no-external-tools  # pure Python, ignore installed scanners
 reconx scan run acme --resume 42          # pick up an interrupted run
 
+reconx scan run acme --allow-account-creation   # prove a registration bypass (see below)
+reconx scan run acme --no-registration          # skip the registration check entirely
+
 reconx scan history acme
 reconx assets list acme --live
 reconx findings list acme --tier confirmed
@@ -173,6 +177,46 @@ off, and only one scan runs per program at a time so the scope's rate limits sti
 
 ---
 
+### Registration that bypasses SSO
+
+An application meant to be reachable only through an identity provider, still shipping an enabled
+local `/register`, is an authentication bypass: anyone can mint themselves an account the
+organisation never issued. The hard part is that over HTTP it looks exactly like a shop letting
+customers sign up, so the check is built around one contradiction rather than the presence of a
+form. All three of these must hold:
+
+1. the sign-in page hands off to an identity provider and carries **no local password form**,
+2. a local registration form exists anyway, posts same-origin, and sets a password,
+3. some area refuses anonymous callers — a redirect to login, a 401 or a 403.
+
+That, reproduced, is **Probable**, and it costs nothing but GETs. An invitation-code field, an
+approval notice, a cross-origin form that only hands off to the provider, or a login page that
+offers local accounts *and* SSO each end the check with that reason recorded.
+
+**Confirmed requires registering**, because only a session proves the endpoint accepts a stranger:
+
+```yaml
+permissions:
+  account_creation: true
+  test_account_email: "you+reconx@example.com"
+```
+
+```bash
+reconx scan run acme --allow-account-creation
+```
+
+Both are required — the flag alone runs the read-only half and tells you why. One account per host,
+plus-addressed under your mailbox and named `ReconX Authorized Test`, never retried and never
+re-created for reproducibility. The proof is differential: the area that refused us anonymously must
+answer the new session with application content. The address goes in the finding so your report can
+ask for it to be deleted.
+
+Whatever that account reaches is scanned for personal data, and **only counts and masked samples are
+stored** — `5 distinct telephone numbers, 5 distinct monetary amounts across 5 table rows`, with
+`62********01` rather than the number. Values that also appear on the anonymous version of the page
+are subtracted first, so a support address in the footer is not a breach. Reaching the page and what
+the page holds are reported as two findings, because they are two different fixes.
+
 ## How it is built to stay safe
 
 These are structural, not advisory:
@@ -183,6 +227,10 @@ These are structural, not advisory:
 - **Polite by default.** Per-host token-bucket rate limiting and concurrency caps, tuned low.
 - **Intrusive checks are opt-in.** No DoS or stress categories at all. `sqlmap` is constrained to
   non-destructive detection.
+- **Writing to a target needs the scope's permission, not a flag.** The one check that can create
+  an account refuses unless `permissions.account_creation` is set in the scope file *and*
+  `--allow-account-creation` is passed. It creates one account per host, plus-addressed under a
+  mailbox you name, and puts the address in the finding so you can ask for it to be deleted.
 - **Full audit log.** Every request recorded with a timestamp, so you can show exactly what you
   touched and when.
 - **Scope-focused by design.** Built to work one program you are authorized on — not for
@@ -200,11 +248,12 @@ scope.yaml → ScopeGuard → Orchestrator (dependency-ordered, parallel, resuma
    ├─ ports ........... naabu or a connect scan → exposed-service findings
    ├─ content ......... robots/sitemap, crawl, archives, JS mining → soft-404 filter
    ├─ params .......... parameter discovery + reflection map
-   └─ vulns ........... nuclei, SQLi, XSS, takeover
+   └─ vulns ........... nuclei, SQLi, XSS, takeover, registration bypass
                               ↓
                       VERIFICATION ENGINE
               baseline · WAF state · reproducibility
               differential · two-oracle SQLi · DOM XSS
+              SSO-boundary contradiction · redacted data scan
                               ↓
    Confirmed / Probable / Needs review / Discarded (with the reason)
                               ↓
