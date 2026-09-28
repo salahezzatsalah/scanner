@@ -282,3 +282,56 @@ def test_bootstrap_script_and_registry_agree() -> None:
         assert name in in_script or name in script, (
             f"{name} is a go-installable tool that bootstrap.sh never mentions"
         )
+
+
+# ---------------------------------------------------------------------------
+# regressions
+# ---------------------------------------------------------------------------
+
+
+async def test_run_verifies_identity_before_executing(guard: ScopeGuard) -> None:
+    """Regression: a stage must not execute a same-named program from elsewhere.
+
+    Identity verification used to happen only in status(), so a runner used
+    without calling it first picked the first binary on PATH. On a machine with
+    the Python httpx package installed, that meant a stage shelled out to the
+    wrong program and reported a tool failure that looked like a ReconX bug.
+    """
+    spec = ToolSpec(
+        name="strict-tool",
+        binary="echo",  # exists, but will not satisfy the identity pattern
+        purpose="testing",
+        install="go install example.com/tool@latest",
+        version_args=("--version",),
+        identity_pattern=r"projectdiscovery",
+        fallback="the built-in path is used",
+    )
+    runner = ToolRunner(spec, guard)
+
+    # The cheap pre-check sees a binary with the right name.
+    assert runner.available is True
+    # The verified check does not, and running must refuse rather than execute it.
+    assert await runner.ensure_available() is False
+    with pytest.raises(ToolNotAvailable):
+        await runner.run([], targets=["www.example.com"])
+
+
+async def test_identity_resolution_is_cached(guard: ScopeGuard) -> None:
+    """Verification executes a subprocess, so it must happen once per runner."""
+    spec = ToolSpec(
+        name="cached", binary="echo", purpose="t", install="n/a",
+        version_args=("--version",), identity_pattern=r"coreutils|echo",
+    )
+    runner = ToolRunner(spec, guard)
+    calls = 0
+    original = runner.status
+
+    async def counting_status():
+        nonlocal calls
+        calls += 1
+        return await original()
+
+    runner.status = counting_status  # type: ignore[method-assign]
+    assert await runner.ensure_available() is True
+    assert await runner.ensure_available() is True
+    assert calls == 1

@@ -144,6 +144,9 @@ class ScopedHttpClient:
         limits = guard.scope.limits
         self._budget = request_budget if request_budget is not None else limits.max_requests_per_scan
         self._requests_made = 0
+        # Requests made on our behalf by an external tool. Tracked separately so
+        # "requests made" stays a true statement about this client.
+        self._external_requests = 0
 
         rate = guard.effective_limit(
             "requests_per_second_per_host", self._settings.requests_per_second_per_host
@@ -197,7 +200,17 @@ class ScopedHttpClient:
 
     @property
     def requests_made(self) -> int:
+        """Requests this client sent itself."""
         return self._requests_made
+
+    @property
+    def external_requests(self) -> int:
+        """Requests external tools sent on our behalf."""
+        return self._external_requests
+
+    @property
+    def total_requests(self) -> int:
+        return self._requests_made + self._external_requests
 
     def audit_records(self) -> list[AuditRecord]:
         return list(self._audit)
@@ -208,6 +221,37 @@ class ScopedHttpClient:
         self._audit.append(record)
         if self._audit_sink is not None:
             self._audit_sink(record)
+
+    def record_external_request(
+        self,
+        *,
+        method: str,
+        url: str,
+        host: str,
+        status: int | None = None,
+        duration_ms: float = 0.0,
+        response_bytes: int = 0,
+        via: str = "external tool",
+    ) -> None:
+        """Fold a request made by an external tool into the audit trail.
+
+        ReconX delegates some probing to tools like httpx that make their own
+        requests. Recording them here keeps one complete record of everything
+        that was touched, which is the point of the audit trail.
+        """
+        self._external_requests += 1
+        self._audit_record(
+            AuditRecord(
+                timestamp=datetime.now(UTC),
+                method=method,
+                url=url,
+                host=host,
+                status=status,
+                duration_ms=duration_ms,
+                response_bytes=response_bytes,
+                matched_rule=f"via {via}",
+            )
+        )
 
     # -- core -------------------------------------------------------------
 

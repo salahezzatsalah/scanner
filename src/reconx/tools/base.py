@@ -252,8 +252,9 @@ class ToolRunner:
         self._guard = guard
         self._default_timeout = default_timeout
         self._env = env
-        # Set by status() once a candidate has passed the identity check.
+        # Set once a candidate has passed the identity check.
         self._resolved_path: str | None = None
+        self._resolution_attempted = False
 
     # -- availability -----------------------------------------------------
 
@@ -263,12 +264,39 @@ class ToolRunner:
 
     @property
     def path(self) -> str | None:
-        """The identity-verified path if status() has run, else a best guess."""
+        """The identity-verified path, once resolution has run.
+
+        Before that it is only a best guess, because more than one binary can
+        carry the name. Callers that are about to *use* the tool must go through
+        :meth:`ensure_available`, which verifies identity.
+        """
         return self._resolved_path or find_binary(self._spec.binary)
 
     @property
     def available(self) -> bool:
-        return self.path is not None
+        """A fast pre-check: does any binary with this name exist?
+
+        Not authoritative. Python's ``httpx`` package installs a CLI that
+        collides with ProjectDiscovery's prober, so a name match is not a tool
+        match. Use :meth:`ensure_available` before running anything.
+        """
+        return find_binary(self._spec.binary) is not None
+
+    async def ensure_available(self) -> bool:
+        """Resolve and verify the tool, once per runner.
+
+        Identity verification means executing the binary, so this is async and
+        the result is cached. This is the check stages should use: without it a
+        stage can pick a same-named program from another ecosystem and fail in a
+        way that looks like a bug in ReconX.
+        """
+        if self._resolved_path is not None:
+            return True
+        if self._resolution_attempted:
+            return False
+        self._resolution_attempted = True
+        status = await self.status()
+        return status.available
 
     async def status(self) -> ToolStatus:
         """Locate the tool, read its version, and confirm it is the right tool.
@@ -361,12 +389,13 @@ class ToolRunner:
         Raises :class:`OutOfScopeError` if every supplied target was refused,
         because running the tool with no targets usually means a scope bug.
         """
-        path = self.path
-        if path is None:
+        if not await self.ensure_available():
             raise ToolNotAvailable(
-                f"{self._spec.name} is not installed. Install it with:\n  {self._spec.install}\n"
+                f"{self._spec.name} is not usable. Install it with:\n  {self._spec.install}\n"
                 f"Without it, {self._spec.fallback}."
             )
+        path = self._resolved_path
+        assert path is not None  # ensure_available() guarantees this
 
         argv: list[str] = [path, *args]
         skipped: list[str] = []

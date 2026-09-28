@@ -14,6 +14,7 @@ from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -56,6 +57,29 @@ __all__ = [
     "write_audit_entries",
     "upsert_schedule_entry",
 ]
+
+
+async def _insert_or_reselect(session: AsyncSession, obj: Any, query) -> tuple[Any, bool]:
+    """Insert a row, tolerating a concurrent insert of the same row.
+
+    Stages at the same dependency level run concurrently in separate sessions,
+    so two of them can propose the same host at the same moment. The loser of
+    that race must find the winner's row rather than raising, so the insert runs
+    in a savepoint that can be rolled back without losing the rest of the
+    session's work.
+
+    Returns ``(row, created)``.
+    """
+    try:
+        async with session.begin_nested():
+            session.add(obj)
+            await session.flush()
+    except IntegrityError:
+        existing = (await session.execute(query)).scalars().first()
+        if existing is None:
+            raise
+        return existing, False
+    return obj, True
 
 
 def _merge_unique(existing: Sequence[str] | None, incoming: Iterable[str] | None) -> list[str]:
@@ -142,14 +166,12 @@ async def upsert_asset(
     ``sources`` accumulates rather than overwrites: knowing that three
     independent sources saw a host is a confidence signal worth keeping.
     """
-    result = await session.execute(
-        select(Asset).where(Asset.program_id == program_id, Asset.host == host)
-    )
-    asset = result.scalars().first()
+    query = select(Asset).where(Asset.program_id == program_id, Asset.host == host)
+    asset = (await session.execute(query)).scalars().first()
     now = utcnow()
 
     if asset is None:
-        asset = Asset(
+        candidate = Asset(
             program_id=program_id,
             host=host,
             kind=kind,
@@ -158,9 +180,9 @@ async def upsert_asset(
             last_seen=now,
             **fields,
         )
-        session.add(asset)
-        await session.flush()
-        return asset, True
+        asset, created = await _insert_or_reselect(session, candidate, query)
+        if created:
+            return asset, True
 
     asset.sources = _merge_unique(asset.sources, sources)
     asset.last_seen = now
@@ -188,18 +210,16 @@ async def upsert_endpoint(
     **fields: Any,
 ) -> tuple[Endpoint, bool]:
     """Create or refresh an endpoint. Returns ``(endpoint, is_new)``."""
-    result = await session.execute(
-        select(Endpoint).where(
-            Endpoint.program_id == program_id,
-            Endpoint.url == url,
-            Endpoint.method == method,
-        )
+    query = select(Endpoint).where(
+        Endpoint.program_id == program_id,
+        Endpoint.url == url,
+        Endpoint.method == method,
     )
-    endpoint = result.scalars().first()
+    endpoint = (await session.execute(query)).scalars().first()
     now = utcnow()
 
     if endpoint is None:
-        endpoint = Endpoint(
+        candidate = Endpoint(
             program_id=program_id,
             asset_id=asset_id,
             url=url,
@@ -209,9 +229,9 @@ async def upsert_endpoint(
             last_seen=now,
             **fields,
         )
-        session.add(endpoint)
-        await session.flush()
-        return endpoint, True
+        endpoint, created = await _insert_or_reselect(session, candidate, query)
+        if created:
+            return endpoint, True
 
     endpoint.parameters = _merge_unique(endpoint.parameters, parameters)
     endpoint.last_seen = now
@@ -241,17 +261,15 @@ async def record_observation(
     source: str = "",
 ) -> tuple[Observation, bool]:
     """Store an information-gathering fact, deduplicated on (kind, key, value)."""
-    result = await session.execute(
-        select(Observation).where(
-            Observation.program_id == program_id,
-            Observation.kind == kind,
-            Observation.key == key,
-            Observation.value == value,
-        )
+    query = select(Observation).where(
+        Observation.program_id == program_id,
+        Observation.kind == kind,
+        Observation.key == key,
+        Observation.value == value,
     )
-    observation = result.scalars().first()
+    observation = (await session.execute(query)).scalars().first()
     if observation is None:
-        observation = Observation(
+        candidate = Observation(
             program_id=program_id,
             asset_id=asset_id,
             kind=kind,
@@ -259,9 +277,9 @@ async def record_observation(
             value=value,
             source=source,
         )
-        session.add(observation)
-        await session.flush()
-        return observation, True
+        observation, created = await _insert_or_reselect(session, candidate, query)
+        if created:
+            return observation, True
 
     observation.last_seen = utcnow()
     session.add(observation)

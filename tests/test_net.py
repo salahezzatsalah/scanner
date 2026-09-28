@@ -126,7 +126,13 @@ def test_no_module_reaches_the_network_around_the_guard() -> None:
     traffic without a scope check — fix the code, never this test.
     """
     allowed = {
-        "httpx.AsyncClient": {Path("src/reconx/net/http.py")},
+        # sources.py is the second constrained channel: it reaches public
+        # intelligence services only, gated by a code-defined allowlist rather
+        # than by the program scope. test_source_client_* below pins that down.
+        "httpx.AsyncClient": {
+            Path("src/reconx/net/http.py"),
+            Path("src/reconx/net/sources.py"),
+        },
         "dns.asyncresolver.Resolver": {Path("src/reconx/net/dns.py")},
         "dns.resolver.Resolver": {Path("src/reconx/net/dns.py")},
     }
@@ -412,3 +418,55 @@ async def test_wildcard_probing_is_skipped_when_probes_are_out_of_scope() -> Non
     assert profile.is_wildcard is False
     assert "not in scope" in (profile.reason or "")
     assert resolver.queries == 0
+
+
+# ---------------------------------------------------------------------------
+# intelligence sources: the second, separately-gated channel
+# ---------------------------------------------------------------------------
+
+
+def test_source_client_allowlist_is_immutable_at_runtime() -> None:
+    """Making this configurable would let a target pose as a data source."""
+    from reconx.net.sources import SOURCE_ALLOWLIST
+
+    with pytest.raises(TypeError):
+        SOURCE_ALLOWLIST["www.example.com"] = "not a source"  # type: ignore[index]
+
+
+async def test_source_client_refuses_anything_off_its_allowlist() -> None:
+    from reconx.net.sources import SourceClient, SourceNotAllowed
+
+    async with SourceClient() as client:
+        for url in (
+            "https://www.example.com/",          # an in-scope target
+            "https://evil.com/",                 # an unrelated host
+            "https://crt.sh.evil.com/",          # suffix confusion
+        ):
+            with pytest.raises(SourceNotAllowed):
+                await client.get(url)
+        assert client.calls == 0
+
+
+def test_source_client_accepts_only_exact_allowlist_hosts() -> None:
+    from reconx.net.sources import SourceClient
+
+    assert SourceClient.is_allowed("https://crt.sh/?q=%25.example.com") is True
+    assert SourceClient.is_allowed("https://web.archive.org/cdx/search") is True
+    assert SourceClient.is_allowed("https://crt.sh.evil.com/") is False
+    assert SourceClient.is_allowed("https://notcrt.sh/") is False
+
+
+def test_no_target_host_can_be_an_intelligence_source() -> None:
+    """The two channels must stay disjoint in kind.
+
+    Every allowlisted source is a public, read-only data service. None is a
+    wildcard, a bare IP, or anything a program scope would plausibly contain.
+    """
+    import ipaddress
+
+    from reconx.net.sources import SOURCE_ALLOWLIST
+
+    for host in SOURCE_ALLOWLIST:
+        assert "*" not in host, f"{host} is a wildcard, which cannot be an exact source"
+        with pytest.raises(ValueError):
+            ipaddress.ip_address(host)  # must be a name, not a raw address

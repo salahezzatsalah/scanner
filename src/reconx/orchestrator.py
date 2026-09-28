@@ -1,0 +1,462 @@
+"""Pipeline orchestration.
+
+Stages declare what they depend on; the orchestrator works out the order, runs
+independent stages together, and records enough state that an interrupted run
+can be resumed rather than restarted. On a long wildcard-program scan, restarting
+from zero because of one network blip is the difference between a tool you leave
+running and one you babysit.
+
+Failure is contained: a stage that fails does not abort the run, but stages that
+depend on it are skipped with that reason recorded, because running them on
+missing input produces confident nonsense.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from typing import Any
+
+from sqlmodel import select
+
+from reconx.config import Settings, get_settings
+from reconx.db.models import RunStatus, ScanRun, StageRun
+from reconx.db.session import get_session_factory
+from reconx.db.store import (
+    finish_scan_run,
+    finish_stage_run,
+    start_scan_run,
+    start_stage_run,
+    upsert_program,
+    write_audit_entries,
+)
+from reconx.net.dns import ScopedResolver
+from reconx.net.http import ScopedHttpClient
+from reconx.net.sources import SourceClient
+from reconx.scope.guard import ScopeGuard
+from reconx.scope.model import Scope
+from reconx.stages.base import Stage, StageContext, StageResult
+from reconx.stages.passive_recon import PassiveReconStage
+from reconx.stages.resolve_probe import ResolveProbeStage
+from reconx.stages.subdomains import SubdomainStage
+
+__all__ = [
+    "STAGE_REGISTRY",
+    "STAGE_GROUPS",
+    "Orchestrator",
+    "RunSummary",
+    "plan_stages",
+    "resolve_stage_names",
+    "StagePlanError",
+]
+
+
+class StagePlanError(ValueError):
+    """A requested stage set cannot be ordered."""
+
+
+STAGE_REGISTRY: dict[str, type[Stage]] = {
+    PassiveReconStage.name: PassiveReconStage,
+    SubdomainStage.name: SubdomainStage,
+    ResolveProbeStage.name: ResolveProbeStage,
+}
+
+# Convenience names for the CLI.
+STAGE_GROUPS: dict[str, tuple[str, ...]] = {
+    "recon": ("passive_recon", "subdomains", "resolve_probe"),
+    "passive": ("passive_recon",),
+    "all": tuple(STAGE_REGISTRY),
+}
+
+
+def resolve_stage_names(requested: Sequence[str] | None) -> list[str]:
+    """Expand group names and validate stage names.
+
+    Dependencies are pulled in automatically: asking for ``resolve_probe`` gets
+    you ``subdomains`` too, because probing an empty host list is not a result.
+    """
+    if not requested:
+        names = list(STAGE_GROUPS["recon"])
+    else:
+        names = []
+        for entry in requested:
+            key = entry.strip().lower()
+            if key in STAGE_GROUPS:
+                names.extend(STAGE_GROUPS[key])
+            elif key in STAGE_REGISTRY:
+                names.append(key)
+            else:
+                raise StagePlanError(
+                    f"unknown stage {entry!r}. Stages: {', '.join(sorted(STAGE_REGISTRY))}. "
+                    f"Groups: {', '.join(sorted(STAGE_GROUPS))}"
+                )
+
+    # Pull in dependencies transitively.
+    needed: list[str] = []
+    seen: set[str] = set()
+
+    def add(name: str) -> None:
+        if name in seen:
+            return
+        seen.add(name)
+        for dependency in STAGE_REGISTRY[name].requires:
+            if dependency in STAGE_REGISTRY:
+                add(dependency)
+        needed.append(name)
+
+    for name in names:
+        add(name)
+    return needed
+
+
+def plan_stages(names: Sequence[str]) -> list[list[str]]:
+    """Group stages into levels that can each run concurrently."""
+    remaining = {
+        name: {
+            dependency
+            for dependency in STAGE_REGISTRY[name].requires
+            if dependency in names
+        }
+        for name in names
+    }
+    levels: list[list[str]] = []
+
+    while remaining:
+        ready = sorted(name for name, deps in remaining.items() if not deps)
+        if not ready:
+            raise StagePlanError(
+                "stage dependencies form a cycle among: " + ", ".join(sorted(remaining))
+            )
+        levels.append(ready)
+        for name in ready:
+            del remaining[name]
+        for deps in remaining.values():
+            deps.difference_update(ready)
+    return levels
+
+
+@dataclass
+class RunSummary:
+    """The outcome of one pipeline run."""
+
+    scan_run_id: int
+    program_slug: str
+    status: RunStatus
+    stages: dict[str, StageResult] = field(default_factory=dict)
+    skipped: dict[str, str] = field(default_factory=dict)
+    requests_made: int = 0
+    tool_requests: int = 0
+    dns_queries: int = 0
+    out_of_scope_blocked: int = 0
+    source_calls: int = 0
+    error: str | None = None
+
+    @property
+    def new_assets(self) -> list[str]:
+        out: list[str] = []
+        for result in self.stages.values():
+            out.extend(result.new_assets)
+        return sorted(set(out))
+
+    @property
+    def total_filtered(self) -> int:
+        return sum(result.items_filtered for result in self.stages.values())
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "scan_run_id": self.scan_run_id,
+            "program": self.program_slug,
+            "status": self.status.value,
+            "requests_made": self.requests_made,
+            "tool_requests": self.tool_requests,
+            "dns_queries": self.dns_queries,
+            "out_of_scope_blocked": self.out_of_scope_blocked,
+            "source_calls": self.source_calls,
+            "new_assets": self.new_assets,
+            "total_filtered": self.total_filtered,
+            "stages": {name: result.as_dict() for name, result in self.stages.items()},
+            "skipped": dict(self.skipped),
+            "error": self.error,
+        }
+
+
+class Orchestrator:
+    """Runs a pipeline for one authorized scope."""
+
+    def __init__(
+        self,
+        scope: Scope,
+        *,
+        scope_yaml: str = "",
+        settings: Settings | None = None,
+        stage_instances: dict[str, Stage] | None = None,
+        use_external_tools: bool = True,
+    ) -> None:
+        self._scope = scope
+        self._scope_yaml = scope_yaml or f"program: {scope.program}"
+        self._settings = settings or get_settings()
+        self._guard = ScopeGuard(scope)
+        self._overrides = stage_instances or {}
+        self._use_external_tools = use_external_tools
+
+    @property
+    def guard(self) -> ScopeGuard:
+        return self._guard
+
+    def _stage(self, name: str) -> Stage:
+        if name in self._overrides:
+            return self._overrides[name]
+        return STAGE_REGISTRY[name]()
+
+    async def run(
+        self,
+        stages: Sequence[str] | None = None,
+        *,
+        trigger: str = "manual",
+        resume_run_id: int | None = None,
+    ) -> RunSummary:
+        """Execute the pipeline. Returns a summary; never raises on stage failure."""
+        names = resolve_stage_names(stages)
+        levels = plan_stages(names)
+
+        factory = get_session_factory(self._settings)
+        async with factory() as session:
+            program = await upsert_program(session, self._scope, self._scope_yaml)
+            await session.commit()
+
+            run, completed = await self._prepare_run(
+                session, program.id, names, trigger, resume_run_id
+            )
+            await session.commit()
+
+            summary = RunSummary(
+                scan_run_id=run.id,
+                program_slug=program.slug,
+                status=RunStatus.RUNNING,
+            )
+
+            http = ScopedHttpClient(self._guard, settings=self._settings)
+            dns = ScopedResolver(self._guard, settings=self._settings)
+            sources = SourceClient(settings=self._settings)
+            shared: dict[str, Any] = {}
+
+            try:
+                for level in levels:
+                    await self._run_level(
+                        level=level,
+                        completed=completed,
+                        summary=summary,
+                        factory=factory,
+                        program_id=program.id,
+                        run_id=run.id,
+                        http=http,
+                        dns=dns,
+                        sources=sources,
+                        shared=shared,
+                    )
+
+                summary.status = RunStatus.FAILED if summary.error else RunStatus.COMPLETED
+            except Exception as exc:  # pragma: no cover - defensive
+                summary.status = RunStatus.FAILED
+                summary.error = f"{type(exc).__name__}: {exc}"
+            finally:
+                summary.requests_made = http.requests_made
+                summary.tool_requests = http.external_requests
+                summary.dns_queries = dns.queries
+                summary.out_of_scope_blocked = self._guard.stats.blocked
+                summary.source_calls = sources.calls
+
+                await write_audit_entries(
+                    session,
+                    http.audit_records(),
+                    program_id=program.id,
+                    scan_run_id=run.id,
+                )
+                await finish_scan_run(
+                    session,
+                    run,
+                    status=summary.status,
+                    error=summary.error,
+                    summary=summary.as_dict(),
+                    requests_made=summary.requests_made + summary.tool_requests,
+                    dns_queries=summary.dns_queries,
+                    out_of_scope_blocked=summary.out_of_scope_blocked,
+                )
+                await session.commit()
+                await http.aclose()
+                await sources.aclose()
+
+            return summary
+
+    # -- internals --------------------------------------------------------
+
+    async def _prepare_run(
+        self,
+        session,
+        program_id: int,
+        names: Sequence[str],
+        trigger: str,
+        resume_run_id: int | None,
+    ) -> tuple[ScanRun, set[str]]:
+        """Start a run, or pick up an existing one and report what is already done."""
+        if resume_run_id is None:
+            run = await start_scan_run(
+                session, program_id, stages=list(names), trigger=trigger
+            )
+            return run, set()
+
+        found = (
+            await session.execute(select(ScanRun).where(ScanRun.id == resume_run_id))
+        ).scalars().first()
+        if found is None:
+            raise StagePlanError(f"no scan run with id {resume_run_id} to resume")
+
+        done = (
+            await session.execute(
+                select(StageRun).where(
+                    StageRun.scan_run_id == resume_run_id,
+                    StageRun.status == RunStatus.COMPLETED,
+                )
+            )
+        ).scalars().all()
+        found.status = RunStatus.RUNNING
+        session.add(found)
+        return found, {stage.stage for stage in done}
+
+    async def _run_level(
+        self,
+        *,
+        level: list[str],
+        completed: set[str],
+        summary: RunSummary,
+        factory,
+        program_id: int,
+        run_id: int,
+        http: ScopedHttpClient,
+        dns: ScopedResolver,
+        sources: SourceClient,
+        shared: dict[str, Any],
+    ) -> None:
+        """Run one dependency level, skipping stages whose inputs are missing."""
+        runnable: list[str] = []
+        for name in level:
+            if name in completed:
+                summary.skipped[name] = "already completed in this run"
+                continue
+            blocked = [
+                dependency
+                for dependency in STAGE_REGISTRY[name].requires
+                if dependency in summary.skipped
+                and "failed" in summary.skipped[dependency]
+            ]
+            if blocked:
+                summary.skipped[name] = (
+                    f"skipped because {', '.join(blocked)} failed"
+                )
+                async with factory() as bookkeeping:
+                    stage_run = await start_stage_run(
+                        bookkeeping, run_id, program_id, name
+                    )
+                    await finish_stage_run(
+                        bookkeeping, stage_run, status=RunStatus.SKIPPED,
+                        error=summary.skipped[name],
+                    )
+                    await bookkeeping.commit()
+                continue
+            runnable.append(name)
+
+        if not runnable:
+            return
+
+        # Stages in one level are independent by construction.
+        results = await asyncio.gather(
+            *(
+                self._run_one(
+                    name=name,
+                    factory=factory,
+                    program_id=program_id,
+                    run_id=run_id,
+                    http=http,
+                    dns=dns,
+                    sources=sources,
+                    shared=shared,
+                )
+                for name in runnable
+            ),
+            return_exceptions=True,
+        )
+
+        for name, outcome in zip(runnable, results, strict=True):
+            if isinstance(outcome, BaseException):
+                summary.skipped[name] = f"failed: {type(outcome).__name__}: {outcome}"
+            else:
+                summary.stages[name] = outcome
+
+    async def _run_one(
+        self,
+        *,
+        name: str,
+        factory,
+        program_id: int,
+        run_id: int,
+        http: ScopedHttpClient,
+        dns: ScopedResolver,
+        sources: SourceClient,
+        shared: dict[str, Any],
+    ) -> StageResult:
+        """Run one stage in its own database session.
+
+        Stages at the same dependency level run concurrently, and a SQLAlchemy
+        session is not safe for concurrent use: sharing one produces "session is
+        already flushing" the moment two stages write at once. A session per
+        stage also means a stage that fails rolls back only its own work.
+        """
+        stage = self._stage(name)
+
+        async with factory() as session:
+            stage_run = await start_stage_run(session, run_id, program_id, name)
+            await session.commit()
+
+            ctx = StageContext(
+                program_id=program_id,
+                scan_run_id=run_id,
+                scope=self._scope,
+                guard=self._guard,
+                http=http,
+                dns=dns,
+                sources=sources,
+                session=session,
+                settings=self._settings,
+                checkpoint=dict(stage_run.checkpoint or {}),
+                shared=shared,
+                use_external_tools=self._use_external_tools,
+            )
+
+            try:
+                result = await stage.run(ctx)
+                await session.commit()
+            except Exception as exc:
+                await session.rollback()
+                await finish_stage_run(
+                    session,
+                    stage_run,
+                    status=RunStatus.FAILED,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                await session.commit()
+                raise
+
+            await finish_stage_run(
+                session,
+                stage_run,
+                status=RunStatus.COMPLETED,
+                items_in=result.items_in,
+                items_out=result.items_out,
+                items_filtered=result.items_filtered,
+                filter_reasons=dict(result.filter_reasons),
+                tools_used=result.tools_used,
+                checkpoint=result.checkpoint,
+            )
+            await session.commit()
+            return result

@@ -78,3 +78,25 @@ async def program(db_session: AsyncSession) -> Program:
     created = await upsert_program(db_session, scope, scope_yaml="program: Example Corp VDP")
     await db_session.commit()
     return created
+
+
+@pytest_asyncio.fixture
+async def file_db(tmp_path, monkeypatch):
+    """Point the process-global engine at a temporary file database.
+
+    The orchestrator opens a session per stage from the global factory, so tests
+    that exercise it need a real shared database rather than the per-test
+    in-memory one.
+    """
+    from reconx.config import reset_settings_cache
+    from reconx.db import session as session_module
+
+    monkeypatch.setenv("RECONX_DATABASE_URL", f"sqlite+aiosqlite:///{tmp_path}/reconx.db")
+    reset_settings_cache()
+    await session_module.dispose_engine()
+    await init_db()
+    try:
+        yield
+    finally:
+        await session_module.dispose_engine()
+        reset_settings_cache()

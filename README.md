@@ -58,7 +58,12 @@ reconx doctor                 # shows what's installed and how to fix gaps
 
 **ReconX runs with zero Go tools installed.** Every stage has a pure-Python fallback, so you get
 useful results immediately and more speed and breadth as you add tools. `reconx doctor` prints the
-exact install command for anything missing.
+exact install command for anything missing, and `--no-external-tools` forces the built-in paths
+when you want a run that does not depend on what happens to be installed.
+
+One caveat `doctor` handles for you: the Python `httpx` package installs a command-line tool with
+the same name as ProjectDiscovery's `httpx` prober. ReconX checks each candidate binary's identity
+before using it, so it picks the right one even when the wrong one comes first on your `PATH`.
 
 Optional extras:
 
@@ -101,16 +106,30 @@ limits:
 ### 2. Run it
 
 ```bash
-reconx scope validate scopes/acme.yaml    # dry-run the guard, no packets sent
-reconx scope add scopes/acme.yaml
+# Check the scope before anything touches the network.
+reconx scope validate scopes/acme.yaml
+reconx scope test scopes/acme.yaml www.acme.com payments.acme.com evil.com
+
+reconx scope add scopes/acme.yaml         # store it under a slug
+reconx scope list
 
 reconx scan run acme --stage recon        # passive recon + subdomains + probe
-reconx scan run acme                      # full pipeline
+reconx scan run acme                      # everything available
+reconx scan run acme --no-brute           # passive enumeration only
+reconx scan run acme --wordlist big.txt   # deeper brute force
+reconx scan run acme --no-external-tools  # pure Python, ignore installed scanners
+reconx scan run acme --resume 42          # pick up an interrupted run
 
+reconx scan history acme
 reconx assets list acme --live
 reconx findings list acme --tier confirmed
-reconx report acme --format markdown -o report.md
+reconx findings list acme --tier discarded   # audit what the filter rejected
+reconx report acme -o report.md
 ```
+
+`scope validate` and `scope test` send no traffic at all, so you can check a
+scope before you trust it. `scope test` exits non-zero if any target you name is
+out of scope, which makes it usable in a script.
 
 ### 3. Run it continuously
 
