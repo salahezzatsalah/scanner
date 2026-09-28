@@ -1,0 +1,62 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "reconx"
+version = "0.1.0"
+description = "Continuous reconnaissance and vulnerability verification platform for authorized security research"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+dependencies = [
+    "httpx[http2]>=0.27",
+    "dnspython>=2.6",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "sqlmodel>=0.0.22",
+    "sqlalchemy>=2.0.30",
+    "aiosqlite>=0.20",
+    "greenlet>=3.0",
+    "alembic>=1.13",
+    "typer>=0.12",
+    "rich>=13.7",
+    "apscheduler>=3.10",
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.30",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.2",
+    "tldextract>=5.1",
+    "pyyaml>=6.0",
+    "jinja2>=3.1",
+]
+
+[project.optional-dependencies]
+postgres = ["asyncpg>=0.29"]
+browser = ["playwright>=1.44"]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "respx>=0.21",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+reconx = "reconx.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/reconx"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["B008", "E501"]

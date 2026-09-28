@@ -1,0 +1,52 @@
+# ---------------------------------------------------------------------------
+# Example ReconX scope file. Copy this per program.
+#
+# The authorization block is REQUIRED. ReconX will not scan without it, and it
+# is what you point at if a program ever asks what you were doing and when.
+# ---------------------------------------------------------------------------
+
+program: "Example Corp VDP"
+platform: hackerone                    # hackerone | bugcrowd | intigriti | private | ...
+program_url: "https://hackerone.com/example"
+notes: |
+  Program rules cap request rate at 5 req/s. Staging hosts are explicitly
+  excluded. Report criticals within 24h.
+
+authorization:
+  authorized_by: "you@example.com"
+  date: "2026-09-28"
+  attestation: >
+    I am enrolled in this program and authorized to test the scope listed
+    below, and I will stay within the program's published rules.
+  reference: "https://hackerone.com/example/policy"   # optional
+
+# ---------------------------------------------------------------------------
+# What you MAY touch.
+#   *.example.com             apex + every subdomain (wildcard program)
+#   api.example.io            one exact host
+#   203.0.113.0/24            an IP range
+#   https://shop.example.net/api/*   host + path prefix only
+#   re:^prod-\d+\.example\.com$      explicit regex for awkward cases
+# ---------------------------------------------------------------------------
+in_scope:
+  - "*.example.com"
+  - "api.example.io"
+  - "203.0.113.0/24"
+
+# ---------------------------------------------------------------------------
+# What you may NOT touch. These always win over in_scope, so a wildcard with
+# carve-outs behaves the way the program means it.
+# ---------------------------------------------------------------------------
+out_of_scope:
+  - "payments.example.com"
+  - "*.internal.example.com"
+  - "*.staging.example.com"
+  - "https://example.com/logout"
+
+# ---------------------------------------------------------------------------
+# Politeness. Program limits belong here and override global .env settings.
+# ---------------------------------------------------------------------------
+limits:
+  requests_per_second_per_host: 5
+  max_concurrent_hosts: 5
+  max_concurrent_requests: 20

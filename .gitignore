@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# ReconX runtime data — never commit scan data or secrets
+.env
+*.db
+*.sqlite
+*.sqlite3
+data/
+loot/
+output/
+reports/
+wordlists/
+nuclei-templates/
+
+# Real program scopes may be confidential; only the example is tracked
+scopes/*.yaml
+!scopes/example.yaml
+
+# OS
+.DS_Store
