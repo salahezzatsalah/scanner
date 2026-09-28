@@ -123,14 +123,17 @@ class _FailingStage(Stage):
         raise RuntimeError("this stage was always going to fail")
 
 
-async def test_stages_at_one_level_run_concurrently_without_session_conflict(
-    file_db,
-) -> None:
-    """Regression: parallel stages used to share one session and collide.
+async def test_stages_at_one_level_all_complete_without_conflict(file_db) -> None:
+    """Regression: two stages at one level used to collide and one would die.
 
-    A SQLAlchemy session is not safe for concurrent use. Sharing one produced
-    "Session is already flushing" the moment two stages wrote at once, which
-    failed the subdomains stage and cascaded into everything after it.
+    Two separate failures produced the same symptom. First, parallel stages
+    shared a single SQLAlchemy session, which is not safe for concurrent use and
+    raised "Session is already flushing". Then, with a session each, SQLite's
+    single-writer limit meant the second writer waited on the first for the whole
+    stage and failed on the busy timeout.
+
+    Both are fixed: a session per stage, and sequential execution under SQLite.
+    What matters either way is that every stage in the level completes.
     """
     scope = make_scope(in_scope=["*.example.com"], out_of_scope=[])
     orchestrator = Orchestrator(
@@ -288,3 +291,50 @@ async def test_run_records_traffic_and_refusals(file_db) -> None:
     )
     summary = await orchestrator.run(["passive"])
     assert summary.out_of_scope_blocked >= 1
+
+
+# ---------------------------------------------------------------------------
+# database concurrency policy
+# ---------------------------------------------------------------------------
+
+
+def test_sqlite_serializes_a_level_and_postgres_does_not() -> None:
+    """SQLite allows one writer, so a level must not run in parallel on it.
+
+    A stage holds its write transaction for its whole duration, so two of them
+    at once means one waits and then fails on the busy timeout. Journal mode does
+    not change that. Postgres has real concurrency and keeps the parallelism.
+    """
+    from reconx.config import Settings
+
+    scope = make_scope(in_scope=["*.example.com"], out_of_scope=[])
+    sqlite = Orchestrator(
+        scope, settings=Settings(database_url="sqlite+aiosqlite:///./data/x.db")
+    )
+    postgres = Orchestrator(
+        scope, settings=Settings(database_url="postgresql+asyncpg://u@h/db")
+    )
+    assert sqlite._serialize_stages is True
+    assert postgres._serialize_stages is False
+
+
+async def test_a_failure_in_a_serialized_level_does_not_stop_its_siblings(
+    file_db,
+) -> None:
+    """Sequential execution must still isolate failures, as gather did."""
+    scope = make_scope(in_scope=["*.example.com"], out_of_scope=[])
+    orchestrator = Orchestrator(
+        scope,
+        use_external_tools=False,
+        stage_instances={
+            # These two share a level. The first fails; the second must still run.
+            "passive_recon": _FailingStage("passive_recon"),
+            "subdomains": _WritingStage("subdomains", ["survived.example.com"]),
+            "resolve_probe": _WritingStage("resolve_probe", []),
+        },
+    )
+    summary = await orchestrator.run(["recon"])
+
+    assert "failed" in summary.skipped["passive_recon"]
+    assert "subdomains" in summary.stages
+    assert "survived.example.com" in summary.new_assets

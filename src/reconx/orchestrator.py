@@ -234,6 +234,8 @@ class Orchestrator:
         self._guard = ScopeGuard(scope)
         self._overrides = stage_instances or {}
         self._use_external_tools = use_external_tools
+        # SQLite has a single-writer limit; see _run_level.
+        self._serialize_stages = self._settings.database_url.startswith("sqlite")
 
     @property
     def guard(self) -> ScopeGuard:
@@ -404,23 +406,43 @@ class Orchestrator:
         if not runnable:
             return
 
-        # Stages in one level are independent by construction.
-        results = await asyncio.gather(
-            *(
-                self._run_one(
-                    name=name,
-                    factory=factory,
-                    program_id=program_id,
-                    run_id=run_id,
-                    http=http,
-                    dns=dns,
-                    sources=sources,
-                    shared=shared,
-                )
-                for name in runnable
-            ),
-            return_exceptions=True,
-        )
+        # Stages in one level are independent by construction, so they *can*
+        # run together. Whether they should depends on the database.
+        #
+        # SQLite permits exactly one writer at a time, whatever the journal
+        # mode, and a stage holds its write transaction for its whole duration.
+        # Two stages writing in parallel therefore means one of them waits for
+        # the other to finish and then fails on the busy timeout, which is
+        # exactly how the port stage died alongside content discovery. WAL and a
+        # generous timeout reduce the window but cannot remove it.
+        #
+        # So under SQLite the level runs sequentially. The work is network-bound
+        # and this costs wall-clock time, but a stage that silently fails is
+        # worse than one that takes longer. Postgres has real concurrency, so
+        # there the level runs in parallel as intended.
+        coroutines = [
+            self._run_one(
+                name=name,
+                factory=factory,
+                program_id=program_id,
+                run_id=run_id,
+                http=http,
+                dns=dns,
+                sources=sources,
+                shared=shared,
+            )
+            for name in runnable
+        ]
+
+        if len(coroutines) > 1 and self._serialize_stages:
+            results: list = []
+            for coroutine in coroutines:
+                try:
+                    results.append(await coroutine)
+                except Exception as exc:  # noqa: BLE001 - recorded per stage below
+                    results.append(exc)
+        else:
+            results = await asyncio.gather(*coroutines, return_exceptions=True)
 
         for name, outcome in zip(runnable, results, strict=True):
             if isinstance(outcome, BaseException):

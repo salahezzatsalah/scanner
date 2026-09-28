@@ -50,11 +50,19 @@ def _clean_version(raw: str) -> str:
     like it carries a version number.
     """
     plain = _ANSI_RE.sub("", raw)
-    lines = [line.strip() for line in plain.splitlines() if line.strip()]
+    lines = []
+    for line in plain.splitlines():
+        # Banners are drawn with block-drawing characters, and the version is
+        # often printed inside one. Replace anything outside printable ASCII so
+        # the decoration falls away and the text survives.
+        cleaned = re.sub(r"[^\x20-\x7e]", " ", line)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        if cleaned:
+            lines.append(cleaned)
+
     for line in lines:
-        # Skip banner art: lines that are mostly punctuation.
-        letters = sum(character.isalnum() for character in line)
-        if letters < 3:
+        # Skip pure decoration: a line with almost no alphanumerics.
+        if sum(character.isalnum() for character in line) < 3:
             continue
         if _VERSION_LINE_RE.search(line):
             return line[:120]

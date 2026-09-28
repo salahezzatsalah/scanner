@@ -32,6 +32,23 @@ def make_scope(**overrides) -> Scope:
     return Scope.model_validate(payload)
 
 
+@pytest.fixture(autouse=True)
+def isolate_settings_from_dotenv(monkeypatch):
+    """Keep the suite hermetic against whatever is in the developer's .env.
+
+    Settings reads `.env` by default, which is correct for the application and
+    wrong for tests: a webhook configured locally silently changed the outcome of
+    three tests that assert on unconfigured defaults. A test must not depend on
+    the machine it runs on, so file loading is switched off for the duration.
+    """
+    from reconx.config import Settings, reset_settings_cache
+
+    monkeypatch.setitem(Settings.model_config, "env_file", None)
+    reset_settings_cache()
+    yield
+    reset_settings_cache()
+
+
 @pytest.fixture
 def scope() -> Scope:
     return make_scope()

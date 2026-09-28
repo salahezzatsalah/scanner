@@ -189,6 +189,9 @@ class PortStage(Stage):
 
         result.used_tool("naabu")
         found: list[OpenPort] = []
+        # naabu repeats a port across its retries, so the same host and port can
+        # appear more than once in one run.
+        seen: set[tuple[str, int]] = set()
         for line in outcome.lines:
             if not line.startswith("{"):
                 continue
@@ -200,9 +203,12 @@ class PortStage(Stage):
             port = row.get("port")
             if not host or not isinstance(port, int):
                 continue
+            if (host, port) in seen:
+                continue
             if not ctx.guard.decide_host(host).allowed:
                 result.filtered("out_of_scope")
                 continue
+            seen.add((host, port))
             found.append(
                 OpenPort(host=host, port=port, service=SERVICE_NAMES.get(port, "unknown"))
             )

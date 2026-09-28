@@ -155,3 +155,138 @@ def test_ordinary_javascript_does_not_look_like_a_credential(benign: str) -> Non
 
     for _label, pattern, _severity in _SECRET_PATTERNS:
         assert not re.search(pattern, benign), f"false positive on: {benign}"
+
+
+# ---------------------------------------------------------------------------
+# katana parity
+# ---------------------------------------------------------------------------
+
+FIXTURE_PAGE = """<!doctype html><html><head><title>Home</title></head><body>
+<a href="/products">products</a>
+<a href="/sqli?id=1">widget</a>
+<form action="/search"><input name="q"><input name="page"><textarea name="note">
+</textarea></form>
+<form><input name="csrf" type="hidden"><input name="username"></form>
+<script src="/static/app.js"></script>
+<a href="mailto:x@example.com">mail</a>
+<a href="#top">top</a>
+</body></html>"""
+
+
+class _StubContext:
+    """Just enough of StageContext for the HTML harvesters."""
+
+    def __init__(self) -> None:
+        self.shared: dict = {}
+
+
+def _collect(page: str, source: str = "crawl"):
+    """Run the shared harvester and return (proposed urls, form params, followable)."""
+    from reconx.stages.content import ContentStage
+
+    ctx = _StubContext()
+    proposed: list[tuple[str, str]] = []
+    stage = ContentStage()
+    followable = stage._harvest_html(
+        ctx, "http://t.example.com/", page, lambda url, src: proposed.append((url, src)), source
+    )
+    return proposed, ctx.shared.get("form_params", {}), followable
+
+
+def test_html_harvest_finds_links_forms_and_scripts() -> None:
+    proposed, forms, _ = _collect(FIXTURE_PAGE)
+    urls = {url for url, _ in proposed}
+
+    assert "http://t.example.com/products" in urls
+    assert "http://t.example.com/sqli?id=1" in urls
+    assert "http://t.example.com/static/app.js" in urls
+    # The form's action, which link extraction alone never yields.
+    assert "http://t.example.com/search" in urls
+    # Its input names, which are the parameters worth testing later.
+    assert forms["http://t.example.com/search"] == ["note", "page", "q"]
+
+
+def test_html_harvest_skips_non_navigable_hrefs() -> None:
+    proposed, _, _ = _collect(FIXTURE_PAGE)
+    urls = {url for url, _ in proposed}
+    assert not any("mailto:" in url for url in urls)
+    assert not any(url.endswith("#top") for url in urls)
+
+
+def test_a_form_with_no_action_attributes_to_its_own_page() -> None:
+    proposed, forms, _ = _collect(FIXTURE_PAGE)
+    del proposed
+    # The second form has no action, so its inputs belong to the page itself.
+    assert forms["http://t.example.com/"] == ["csrf", "username"]
+
+
+def test_katana_output_yields_the_same_things_as_the_builtin_crawler() -> None:
+    """Regression: installing katana used to make the scan find *less*.
+
+    Katana's endpoint list is link-driven, so it never reported a form's action
+    or its input names. Because the katana path returned early, the built-in
+    crawler that did find those never ran, and a genuinely vulnerable form
+    endpoint was silently dropped. Katana's JSONL carries the response body, so
+    the same parsing now runs over what it already fetched.
+    """
+    import json
+
+    from reconx.stages.content import ContentStage
+
+    # One katana JSONL row, shaped as katana v1.7 emits it.
+    row = {
+        "request": {"method": "GET", "endpoint": "http://t.example.com/"},
+        "response": {
+            "status_code": 200,
+            "headers": {"Content-Type": "text/html; charset=utf-8"},
+            "body": FIXTURE_PAGE,
+        },
+    }
+
+    ctx = _StubContext()
+    proposed: list[tuple[str, str]] = []
+
+    class _Result:
+        def __init__(self) -> None:
+            self.notes: list[str] = []
+
+        def note(self, message: str) -> None:
+            self.notes.append(message)
+
+    stage = ContentStage()
+    stage._harvest_katana(
+        ctx, [json.dumps(row)], lambda url, src: proposed.append((url, src)), _Result()
+    )
+
+    urls = {url for url, _ in proposed}
+    builtin_urls = {url for url, _ in _collect(FIXTURE_PAGE)[0]}
+
+    # Everything the built-in crawler finds on this page, katana's path finds too.
+    missing = builtin_urls - urls
+    assert missing == set(), f"the katana path lost: {missing}"
+    # Including the form action and its parameters.
+    assert "http://t.example.com/search" in urls
+    assert ctx.shared["form_params"]["http://t.example.com/search"] == ["note", "page", "q"]
+
+
+def test_katana_rows_without_a_body_are_tolerated() -> None:
+    """Not every katana row carries a response, and a missing one is not an error."""
+    import json
+
+    from reconx.stages.content import ContentStage
+
+    class _Result:
+        def note(self, message: str) -> None:
+            pass
+
+    ctx = _StubContext()
+    proposed: list[tuple[str, str]] = []
+    rows = [
+        json.dumps({"request": {"endpoint": "http://t.example.com/only-a-link"}}),
+        "not json at all",
+        json.dumps({"response": {"body": "<html></html>"}}),  # no endpoint
+    ]
+    ContentStage()._harvest_katana(
+        ctx, rows, lambda url, src: proposed.append((url, src)), _Result()
+    )
+    assert ("http://t.example.com/only-a-link", "katana") in proposed

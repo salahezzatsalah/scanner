@@ -265,8 +265,15 @@ class ContentStage(Stage):
         if await runner.ensure_available():
             try:
                 outcome = await runner.run(
-                    ["-silent", "-jsonl", "-depth", str(self._crawl_depth),
-                     "-known-files", "all", "-u"],
+                    [
+                        "-silent", "-jsonl",
+                        "-depth", str(self._crawl_depth),
+                        "-known-files", "all",
+                        # Ask katana for form, input, textarea and select elements
+                        # as well as links.
+                        "-form-extraction",
+                        "-u",
+                    ],
                     targets=[base_url],
                     timeout=600.0,
                 )
@@ -274,20 +281,95 @@ class ContentStage(Stage):
                 outcome = None
             if outcome is not None and outcome.lines:
                 result.used_tool("katana")
-                for line in outcome.lines:
-                    if not line.startswith("{"):
-                        continue
-                    try:
-                        row = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    endpoint = (row.get("request") or {}).get("endpoint") or row.get("endpoint")
-                    if endpoint:
-                        propose(str(endpoint), "katana")
+                self._harvest_katana(ctx, outcome.lines, propose, result)
                 return
 
         result.used_fallback("crawling with the built-in HTML parser instead of katana")
         await self._builtin_crawl(ctx, base_url, propose, result)
+
+    def _harvest_katana(
+        self, ctx: StageContext, lines: list[str], propose, result: StageResult
+    ) -> None:
+        """Take everything katana found, including from the bodies it returns.
+
+        Katana's endpoint list is link-driven, so it misses a form's action and
+        never reports the input names, which are exactly the parameters worth
+        testing later. Its JSONL carries the full response body, so those are
+        parsed out of what it already fetched rather than by crawling again.
+        Without this, installing katana made the scan find *less* than the
+        built-in crawler, which is backwards.
+        """
+        pages = 0
+        for line in lines:
+            if not line.startswith("{"):
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            request = row.get("request") or {}
+            endpoint = request.get("endpoint") or row.get("endpoint")
+            if endpoint:
+                propose(str(endpoint), "katana")
+
+            response = row.get("response") or {}
+            body = response.get("body")
+            content_type = str(
+                (response.get("headers") or {}).get("Content-Type", "")
+            ).lower()
+            if not body or not endpoint:
+                continue
+
+            if "html" in content_type or "<html" in body[:2000].lower():
+                self._harvest_html(ctx, str(endpoint), body, propose, "katana")
+                pages += 1
+
+        if pages:
+            result.note(
+                f"parsed {pages} page(s) from katana's own output for forms and links"
+            )
+
+    def _harvest_html(
+        self, ctx: StageContext, page_url: str, body: str | bytes, propose, source: str
+    ) -> list[str]:
+        """Pull links and form parameters out of one HTML page.
+
+        Shared by the katana path and the built-in crawler so both find the same
+        things. Returns the targets worth following, for callers that crawl.
+        """
+        soup = BeautifulSoup(body, "lxml")
+        followable: list[str] = []
+
+        for tag, attribute in (
+            ("a", "href"), ("link", "href"), ("script", "src"),
+            ("img", "src"), ("form", "action"), ("iframe", "src"),
+        ):
+            for element in soup.find_all(tag):
+                value = element.get(attribute)
+                if not value or value.startswith(("mailto:", "tel:", "javascript:", "#")):
+                    continue
+                target = _normalize_url(urljoin(page_url, value))
+                propose(target, source)
+                if tag in {"a", "form"}:
+                    followable.append(target)
+
+        # A form's inputs are the parameters the vulnerability stage will test.
+        for form in soup.find_all("form"):
+            action = _normalize_url(urljoin(page_url, form.get("action") or page_url))
+            names = [
+                element.get("name")
+                for element in form.find_all(["input", "textarea", "select"])
+                if element.get("name")
+            ]
+            if names:
+                existing = ctx.shared.setdefault("form_params", {})
+                merged = set(existing.get(action) or []) | set(names)
+                existing[action] = sorted(merged)
+                propose(action, "form")
+                followable.append(action)
+
+        return followable
 
     async def _builtin_crawl(self, ctx, base_url, propose, result: StageResult) -> None:
         """A breadth-first crawl of links, forms and script sources."""
@@ -319,36 +401,11 @@ class ContentStage(Stage):
             if "html" not in content_type:
                 continue
 
-            soup = BeautifulSoup(response.body, "lxml")
-            for tag, attribute in (
-                ("a", "href"), ("link", "href"), ("script", "src"),
-                ("img", "src"), ("form", "action"), ("iframe", "src"),
-            ):
-                for element in soup.find_all(tag):
-                    value = element.get(attribute)
-                    if not value or value.startswith(("mailto:", "tel:", "javascript:", "#")):
-                        continue
-                    target = _normalize_url(urljoin(url, value))
-                    propose(target, "crawl")
-                    if (
-                        depth < self._crawl_depth
-                        and tag in {"a", "form"}
-                        and target not in seen
-                        and len(seen) < 200
-                    ):
+            followable = self._harvest_html(ctx, url, response.body, propose, "crawl")
+            if depth < self._crawl_depth:
+                for target in followable:
+                    if target not in seen and len(seen) < 200:
                         frontier.append((target, depth + 1))
-
-            # Form inputs are the parameters worth testing later.
-            for form in soup.find_all("form"):
-                action = _normalize_url(urljoin(url, form.get("action") or url))
-                names = [
-                    element.get("name")
-                    for element in form.find_all(["input", "textarea", "select"])
-                    if element.get("name")
-                ]
-                if names:
-                    ctx.shared.setdefault("form_params", {})[action] = sorted(set(names))
-                    propose(action, "form")
 
     async def _mine_scripts(
         self,
