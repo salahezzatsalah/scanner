@@ -99,6 +99,21 @@ PLAYBOOKS: dict[str, tuple[str, str]] = {
         "A template says where to look, not what is true. This one reproduced, "
         "which is not the same as being exploitable.",
     ),
+    "auth_bypass": (
+        "Establish what the account can actually reach before reporting: which "
+        "pages, which data, which actions. Then check whether the same account "
+        "survives a logout, and whether any admin-only route answers it.",
+        "Triage rates 'I made an account' far below 'the account I made can read "
+        "every customer record'. Name the account you created so it can be deleted, "
+        "and do not create a second one to see if it still works.",
+    ),
+    "sensitive_data_exposure": (
+        "Report the shape of the exposure — how many records, which fields, which "
+        "endpoint — and stop there. Take the smallest sample that proves it.",
+        "Pulling the whole data set turns a report into an incident you are part "
+        "of. Counts and field names prove impact; copies of strangers' records "
+        "prove it no better and are far harder to justify.",
+    ),
     "misconfiguration": (
         "Work out what the misconfiguration actually enables before reporting it.",
         "Most misconfiguration reports are closed as informational because the "

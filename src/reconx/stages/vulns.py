@@ -13,6 +13,9 @@ before any of it becomes a reported finding:
   real browser execution.
 * **Subdomain takeover**, requiring delegation, an unclaimed service page, and a
   dangling check.
+* **Self-registration across an SSO boundary**, requiring an identity-provider
+  sign-in with no local password form, a local registration form anyway, and an
+  area that refuses anonymous callers.
 
 Findings are correlated on the vulnerability class and the normalised path and
 parameter rather than on the full URL, so one issue across fifty hosts of the
@@ -34,6 +37,7 @@ from reconx.stages.base import Stage, StageContext, StageResult
 from reconx.tools.base import ToolNotAvailable
 from reconx.triage.priority import compute_priority
 from reconx.verify.baseline import BaselineCollector
+from reconx.verify.registration import RegistrationVerifier
 from reconx.verify.reproduce import reproduce
 from reconx.verify.sqli import SqliVerifier
 from reconx.verify.takeover import TakeoverVerifier
@@ -83,19 +87,25 @@ class VulnStage(Stage):
         check_sqli: bool = True,
         check_xss: bool = True,
         check_takeover: bool = True,
+        check_registration: bool = True,
+        allow_account_creation: bool = False,
         enable_timing: bool = True,
         headless_xss: bool = True,
         max_parameters: int = 150,
         max_takeover_hosts: int = 200,
+        max_registration_hosts: int = 25,
     ) -> None:
         self._run_nuclei = run_nuclei
         self._check_sqli = check_sqli
         self._check_xss = check_xss
         self._check_takeover = check_takeover
+        self._check_registration = check_registration
+        self._allow_account_creation = allow_account_creation
         self._enable_timing = enable_timing
         self._headless_xss = headless_xss
         self._max_parameters = max_parameters
         self._max_takeover_hosts = max_takeover_hosts
+        self._max_registration_hosts = max_registration_hosts
 
     # -- entry point -------------------------------------------------------
 
@@ -111,6 +121,8 @@ class VulnStage(Stage):
 
         if self._check_takeover:
             await self._takeovers(ctx, result)
+        if self._check_registration:
+            await self._registration(ctx, result)
         if self._run_nuclei:
             await self._nuclei(ctx, result)
         if self._check_sqli or self._check_xss:
@@ -174,6 +186,150 @@ class VulnStage(Stage):
                     "to remove the dangling DNS record."
                 ),
             )
+
+    # -- self-registration across an SSO boundary ---------------------------
+
+    async def _registration(self, ctx: StageContext, result: StageResult) -> None:
+        """Look for a local sign-up on applications that authenticate elsewhere.
+
+        Account creation is refused unless the scope grants it. A CLI flag alone
+        cannot authorize writing to a target: the permission has to sit in the
+        same document as the attestation, so ``--allow-account-creation`` against
+        a scope that does not permit it runs the read-only half and says so.
+        """
+        targets = (await self._live_urls(ctx))[: self._max_registration_hosts]
+        if not targets:
+            return
+
+        permitted = ctx.guard.permits("account_creation")
+        if self._allow_account_creation and not permitted:
+            result.note(
+                "account creation was requested on the command line but the scope "
+                "does not grant permissions.account_creation, so registration was "
+                "only looked for, never submitted"
+            )
+        active = self._allow_account_creation and permitted
+
+        verifier = RegistrationVerifier(
+            ctx.http,
+            baselines=self._baselines,
+            attempts=ctx.settings.reproduce_attempts,
+            required=max(2, ctx.settings.reproduce_required - 1),
+            allow_account_creation=active,
+            probe_email=ctx.scope.permissions.test_account_email if active else None,
+        )
+
+        known = await self._known_urls(ctx)
+        result.items_in += len(targets)
+
+        for base_url in targets:
+            verdict = await verifier.verify(base_url, known_urls=known)
+
+            # A host with no sign-up page was never a candidate, so it is
+            # counted rather than stored: the discard log is for judgements
+            # about candidates, and filling it with "this host has no
+            # /register" would bury the ones worth auditing.
+            if verdict.registration_url is None:
+                result.filtered("no_registration_form")
+                continue
+            if verdict.tier is FindingTier.DISCARDED:
+                result.filtered("registration_not_a_bypass")
+
+            host = verdict.host
+            template = normalize_path_template(verdict.registration_url)
+            await self._save(
+                ctx,
+                result,
+                dedup_key=f"auth_bypass::self_registration::{template}",
+                vuln_class="auth_bypass",
+                title=(
+                    f"Unauthenticated self-registration bypasses SSO at {template}"
+                    if verdict.vulnerable
+                    else f"Self-registration at {template}"
+                ),
+                severity=verdict.severity,
+                tier=verdict.tier,
+                confidence=verdict.confidence,
+                reason=verdict.reason,
+                signals=verdict.signals,
+                hosts=[host],
+                detector="reconx:registration",
+                evidence=verdict.evidence,
+                obstructed=verdict.obstructed,
+                recommendation=self._registration_recommendation(verdict),
+            )
+
+            if verdict.created_account:
+                result.note(
+                    f"an account was created on {host} to prove the bypass: "
+                    f"{verdict.created_account} — name it in the report and ask for "
+                    "it to be deleted"
+                )
+
+            # Reaching the page is one issue; what the page holds is another, and
+            # they are fixed in different places.
+            scan = verdict.data_scan
+            if verdict.session_confirmed and scan is not None and scan.significant:
+                await self._save(
+                    ctx,
+                    result,
+                    dedup_key=f"sensitive_data_exposure::{template}",
+                    vuln_class="sensitive_data_exposure",
+                    title=(
+                        "Customer records rendered to a self-registered account at "
+                        f"{verdict.protected_area.url if verdict.protected_area else host}"
+                    ),
+                    severity=Severity.CRITICAL,
+                    tier=FindingTier.CONFIRMED,
+                    confidence=90,
+                    reason=(
+                        f"The account created at {verdict.registration_url} reached "
+                        f"{verdict.protected_area.url if verdict.protected_area else host}, "
+                        f"which rendered {scan.summary()} directly in the response body. "
+                        "Counts and redacted samples are recorded; the values themselves "
+                        "were deliberately not stored"
+                    ),
+                    signals=[*verdict.signals, "sensitive_data_exposed"],
+                    hosts=[host],
+                    detector="reconx:registration",
+                    evidence=[
+                        item
+                        for item in verdict.evidence
+                        if "personal data" in str(item.get("label", ""))
+                    ],
+                    obstructed=verdict.obstructed,
+                    recommendation=(
+                        "Report the record count and the field names, not the records. "
+                        "The authorization fix and the data-exposure fix are separate: "
+                        "closing registration still leaves every other unauthorized "
+                        "account able to read this page."
+                    ),
+                )
+
+    @staticmethod
+    def _registration_recommendation(verdict) -> str | None:
+        if not verdict.vulnerable:
+            return None
+        if verdict.created_account:
+            return (
+                f"Report with the registration request and the session that reached "
+                f"{verdict.protected_area.url if verdict.protected_area else 'the protected area'}, "
+                f"and ask for {verdict.created_account} to be deleted. The fix is to "
+                "disable local registration and provision staff through the identity "
+                "provider; check for other accounts created the same way."
+            )
+        return (
+            f"Submit the form at {verdict.registration_url} by hand to confirm the "
+            "endpoint accepts a stranger — the program's rules decide whether you may. "
+            "If it does, report the session it returns, not the form's existence."
+        )
+
+    async def _known_urls(self, ctx: StageContext) -> list[str]:
+        """Endpoints discovery already found, so the check asks before guessing."""
+        rows = await ctx.session.execute(
+            select(Endpoint).where(Endpoint.program_id == ctx.program_id)
+        )
+        return [endpoint.url for endpoint in rows.scalars().all()]
 
     # -- nuclei -------------------------------------------------------------
 

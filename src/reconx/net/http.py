@@ -14,6 +14,9 @@ Three behaviours are worth calling out:
   ``Retry-After`` when present.
 * **Every request is audited.** The audit trail is what lets a researcher show
   precisely what they touched and when.
+* **A session can be contained.** A check that authenticates would otherwise
+  leave its cookies in the shared jar and silently authenticate the rest of the
+  scan; :meth:`ScopedHttpClient.isolated_cookies` scopes them to the check.
 """
 
 from __future__ import annotations
@@ -21,7 +24,8 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import deque
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -204,6 +208,11 @@ class ScopedHttpClient:
         return self._requests_made
 
     @property
+    def cookies(self) -> dict[str, str]:
+        """A snapshot of the cookie jar, so a check can see what a response set."""
+        return dict(self._client.cookies)
+
+    @property
     def external_requests(self) -> int:
         """Requests external tools sent on our behalf."""
         return self._external_requests
@@ -214,6 +223,27 @@ class ScopedHttpClient:
 
     def audit_records(self) -> list[AuditRecord]:
         return list(self._audit)
+
+    # -- sessions ---------------------------------------------------------
+
+    @contextmanager
+    def isolated_cookies(self) -> Iterator[None]:
+        """Contain any cookies a block picks up, then restore the jar.
+
+        A check that registers or logs in receives a session cookie, and the
+        underlying client keeps cookies for the rest of its life. Without this,
+        one authentication would quietly authenticate every later request in the
+        scan: baselines would be learned as a logged-in user, and "this page is
+        reachable" would stop meaning what it says.
+
+        The jar is per-client rather than per-task, so this *contains* a session
+        rather than partitioning one. Use it around a single check at a time.
+        """
+        saved = httpx.Cookies(self._client.cookies)
+        try:
+            yield
+        finally:
+            self._client.cookies = saved
 
     # -- audit ------------------------------------------------------------
 
@@ -265,6 +295,7 @@ class ScopedHttpClient:
         content: bytes | str | None = None,
         data: Mapping[str, Any] | None = None,
         json: Any = None,
+        cookies: Mapping[str, str] | None = None,
         follow_redirects: bool = True,
         read_body: bool = True,
         max_body_bytes: int = 2_000_000,
@@ -323,6 +354,7 @@ class ScopedHttpClient:
                 content=content,
                 data=data,
                 json=json,
+                cookies=cookies,
                 read_body=read_body,
                 max_body_bytes=max_body_bytes,
             )
@@ -369,8 +401,9 @@ class ScopedHttpClient:
         content: bytes | str | None,
         data: Mapping[str, Any] | None,
         json: Any,
-        read_body: bool,
-        max_body_bytes: int,
+        cookies: Mapping[str, str] | None = None,
+        read_body: bool = True,
+        max_body_bytes: int = 2_000_000,
     ) -> ScopedResponse:
         host = urlsplit(url).hostname or ""
         attempts = self._settings.max_retries + 1
@@ -396,6 +429,7 @@ class ScopedHttpClient:
                         content=content,
                         data=dict(data) if data else None,
                         json=json,
+                        cookies=dict(cookies) if cookies else None,
                     )
                     body = b""
                     if read_body:

@@ -8,6 +8,12 @@ This serves, on 127.0.0.1 only:
   ``/xss``                            reflects input unencoded into the HTML body
   ``/sqli``                           genuine boolean-differential behaviour
 
+  ``/login``                          an SSO-only sign-in: no local password
+  ``/register``                       a local sign-up that works anyway
+  ``/dashboard``                      staff-only; redirects anonymous callers
+                                      to ``/login`` and serves customer records
+                                      to anyone holding a session
+
 **Deliberate false-positive traps**
   unknown paths      HTTP 200 carrying a "not found" page (soft-404), so a
                      scanner without baseline learning thinks every path exists
@@ -15,6 +21,13 @@ This serves, on 127.0.0.1 only:
   ``/static-error``  always contains a SQL error string, whatever you send
   ``/jitter``        random latency, which mimics time-based injection
   ``/waf``           returns a block page, as a WAF would
+  ``/shop/*``        public sign-up with no identity provider anywhere: an
+                     ordinary consumer account system, not a bypass
+  ``/sso/register``  a "register" page that only hands off to the identity
+                     provider, so it creates nothing locally
+  ``/invite/*``      registration gated behind an invitation code
+  ``/both/*``        an identity provider *and* a local password login, which
+                     is a deliberate design rather than a boundary to cross
 
 Each trap corresponds to a class of finding other scanners report and ReconX is
 supposed to discard. The integration tests assert both halves: the real issues
@@ -72,6 +85,105 @@ _STATIC_ERROR = """<!doctype html><html><head><title>Product</title></head>
 near 'LIMIT 1' at line 3. This message is part of the page template.</pre>
 <p>Product id: %s</p></body></html>"""
 
+# ---------------------------------------------------------------------------
+# A staff portal that authenticates through an identity provider — and ships an
+# enabled local sign-up anyway. This is the shape the registration check exists
+# to find, with the surrounding traps that make finding it non-trivial.
+# ---------------------------------------------------------------------------
+
+_IDP = "https://login.microsoftonline.com/ffffffff-0000-0000-0000-000000000000"
+
+# Sign-in offers one route in: the identity provider. No password field.
+_SSO_LOGIN = f"""<!doctype html><html><head><title>Staff sign in</title></head>
+<body><h1>Example Salon Staff Portal</h1>
+<p>Staff accounts are managed by IT. Sign in with your work account.</p>
+<a class="btn" href="{_IDP}/oauth2/v2.0/authorize?client_id=abc&response_type=code">
+Sign in with Microsoft</a>
+<p class="meta">Having trouble? Contact the service desk.</p></body></html>"""
+
+# ...and yet this is reachable, unauthenticated, and creates a local password.
+_REGISTER = """<!doctype html><html><head><title>Create staff account</title></head>
+<body><h1>Create your account</h1>
+<form method="POST" action="/register">
+<input type="hidden" name="_token" value="%s">
+<input name="name" placeholder="Name" required>
+<input type="email" name="email" placeholder="Email" required>
+<input type="password" name="password" required>
+<input type="password" name="password_confirmation" required>
+<button type="submit">Register</button></form></body></html>"""
+
+# The page the bypass reaches: customer records, straight in the HTML.
+_DASHBOARD = """<!doctype html><html><head><title>Dashboard</title></head>
+<body><h1>Halo, %s</h1>
+<p>Total Pesanan: 5 &middot; Total Pesanan Tertunda: 5</p>
+<table><thead><tr><th>Customer</th><th>Mobile</th><th>Status</th><th>Amount</th>
+<th>Timestamp</th></tr></thead><tbody>
+<tr><td>Ani</td><td>6281100000101</td><td>Tertunda</td><td>Rp 788,421</td>
+<td>28-09-2026 23:49:57</td></tr>
+<tr><td>Budi</td><td>6281100000102</td><td>Tertunda</td><td>Rp 362,511</td>
+<td>28-09-2026 23:49:43</td></tr>
+<tr><td>Citra</td><td>6281100000103</td><td>Tertunda</td><td>Rp 2,461,157</td>
+<td>28-09-2026 23:45:36</td></tr>
+<tr><td>Dewi</td><td>6281100000104</td><td>Tertunda</td><td>Rp 1,172,324</td>
+<td>28-09-2026 23:41:02</td></tr>
+<tr><td>Eko</td><td>6281100000105</td><td>Tertunda</td><td>Rp 124,199</td>
+<td>28-09-2026 23:38:19</td></tr>
+</tbody></table></body></html>"""
+
+# Trap: an ordinary consumer shop. Public sign-up is the product, not a bug.
+_SHOP_LOGIN = """<!doctype html><html><head><title>Sign in</title></head>
+<body><h1>Sign in to your account</h1>
+<form method="POST" action="/shop/login"><input name="email">
+<input type="password" name="password"><button type="submit">Sign in</button>
+</form><p>New here? <a href="/shop/signup">Create an account</a></p>
+</body></html>"""
+
+_SHOP_SIGNUP = """<!doctype html><html><head><title>Create an account</title></head>
+<body><h1>Create an account</h1>
+<form method="POST" action="/shop/signup">
+<input name="full_name"><input type="email" name="email">
+<input type="password" name="password">
+<input type="password" name="password_confirmation">
+<button type="submit">Sign up</button></form></body></html>"""
+
+# Trap: looks like registration, posts to the identity provider. Nothing local
+# is created, so there is nothing to bypass.
+_SSO_HANDOFF = f"""<!doctype html><html><head><title>Register</title></head>
+<body><h1>Create your account</h1>
+<form method="POST" action="{_IDP}/signup">
+<input type="hidden" name="client_id" value="abc">
+<input name="email"><input type="password" name="passwd">
+<button type="submit">Create account</button></form></body></html>"""
+
+# Trap: provisioning is controlled, whatever the form looks like.
+_INVITE_REGISTER = """<!doctype html><html><head><title>Register</title></head>
+<body><h1>Create your account</h1>
+<p>You need an invitation code from your administrator.</p>
+<form method="POST" action="/invite/register">
+<input name="full_name"><input type="email" name="email">
+<input name="invitation_code" required>
+<input type="password" name="password">
+<input type="password" name="password_confirmation">
+<button type="submit">Register</button></form></body></html>"""
+
+# Trap: the identity provider is one option among two. Local accounts are
+# clearly intended here, so registration is not crossing anything.
+_BOTH_LOGIN = f"""<!doctype html><html><head><title>Sign in</title></head>
+<body><h1>Sign in</h1>
+<a href="{_IDP}/oauth2/v2.0/authorize?client_id=abc">Sign in with Microsoft</a>
+<p>or use your email</p>
+<form method="POST" action="/both/login"><input name="email">
+<input type="password" name="password"><button type="submit">Sign in</button>
+</form></body></html>"""
+
+_BOTH_REGISTER = """<!doctype html><html><head><title>Register</title></head>
+<body><h1>Create your account</h1>
+<form method="POST" action="/both/register">
+<input name="full_name"><input type="email" name="email">
+<input type="password" name="password">
+<input type="password" name="password_confirmation">
+<button type="submit">Register</button></form></body></html>"""
+
 _JS_FILE = """// app.js
 const API_BASE = "/api/v1";
 fetch(API_BASE + "/users");
@@ -101,15 +213,33 @@ class _Handler(BaseHTTPRequestHandler):
     # -- helpers ----------------------------------------------------------
 
     def _send(
-        self, status: int, body: str, content_type: str = "text/html; charset=utf-8"
+        self,
+        status: int,
+        body: str,
+        content_type: str = "text/html; charset=utf-8",
+        extra: dict[str, str] | None = None,
     ) -> None:
         payload = body.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("X-Powered-By", "ExampleCorp")
+        for name, value in (extra or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(payload)
+
+    def _redirect(self, location: str, extra: dict[str, str] | None = None) -> None:
+        self._send(302, "", extra={"Location": location, **(extra or {})})
+
+    def _session(self) -> str | None:
+        """The staff session this request carries, if the server issued it."""
+        raw = self.headers.get("Cookie") or ""
+        for chunk in raw.split(";"):
+            name, _, value = chunk.strip().partition("=")
+            if name == "staff_session" and value in self.server.sessions:  # type: ignore[attr-defined]
+                return value
+        return None
 
     @staticmethod
     def _one(params: dict[str, list[str]], name: str, default: str = "") -> str:
@@ -128,6 +258,43 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, _HOME)
         elif path == "/admin":
             self._send(200, _ADMIN % random.randint(10**9, 10**10))
+        # --- the staff portal: SSO sign-in, open sign-up, protected area ---
+        elif path == "/login":
+            self._send(200, _SSO_LOGIN)
+        elif path == "/register":
+            self._send(200, _REGISTER % random.randint(10**19, 10**20))
+        elif path == "/dashboard":
+            session = self._session()
+            if session is None:
+                self._redirect("/login")
+            else:
+                name = self.server.sessions[session]  # type: ignore[attr-defined]
+                self._send(200, _DASHBOARD % html.escape(name))
+        # --- traps ---------------------------------------------------------
+        elif path == "/shop/login":
+            self._send(200, _SHOP_LOGIN)
+        elif path == "/shop/signup":
+            self._send(200, _SHOP_SIGNUP)
+        elif path == "/shop/account":
+            self._redirect("/shop/login")
+        elif path == "/sso/register":
+            self._send(200, _SSO_HANDOFF)
+        elif path == "/sso/login":
+            self._send(200, _SSO_LOGIN)
+        elif path == "/sso/dashboard":
+            self._redirect("/sso/login")
+        elif path == "/invite/register":
+            self._send(200, _INVITE_REGISTER)
+        elif path == "/invite/login":
+            self._send(200, _SSO_LOGIN)
+        elif path == "/invite/dashboard":
+            self._redirect("/invite/login")
+        elif path == "/both/login":
+            self._send(200, _BOTH_LOGIN)
+        elif path == "/both/register":
+            self._send(200, _BOTH_REGISTER)
+        elif path == "/both/dashboard":
+            self._redirect("/both/login")
         elif path == "/robots.txt":
             self._send(
                 200,
@@ -246,8 +413,34 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         length = int(self.headers.get("Content-Length") or 0)
-        if length:
-            self.rfile.read(length)
+        raw = self.rfile.read(length).decode("utf-8", "replace") if length else ""
+        path = urlsplit(self.path).path.rstrip("/") or "/"
+        self.server.record(f"POST {path}")  # type: ignore[attr-defined]
+        fields = {key: values[0] for key, values in parse_qs(raw).items()}
+
+        # The whole point of the fixture: an unauthenticated POST creates a
+        # staff account and is handed a session on the spot.
+        if path == "/register":
+            email = fields.get("email", "")
+            password = fields.get("password", "")
+            if (
+                not fields.get("_token")
+                or "@" not in email
+                or not password
+                or password != fields.get("password_confirmation")
+            ):
+                self._send(422, "<html><title>Invalid</title><body>check the form</body></html>")
+                return
+            name = fields.get("name") or email.split("@")[0]
+            token = f"sess-{random.randint(10**15, 10**16)}"
+            self.server.sessions[token] = name  # type: ignore[attr-defined]
+            self.server.accounts.append(dict(fields))  # type: ignore[attr-defined]
+            self._redirect(
+                "/dashboard",
+                {"Set-Cookie": f"staff_session={token}; Path=/; HttpOnly"},
+            )
+            return
+
         self._send(200, "<html><title>Accepted</title><body>ok</body></html>")
 
 
@@ -258,6 +451,10 @@ class _Server(ThreadingHTTPServer):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.requested: list[str] = []
+        # Sessions the app has issued, and the accounts that produced them, so
+        # a test can assert what a scan actually left behind on the target.
+        self.sessions: dict[str, str] = {}
+        self.accounts: list[dict[str, str]] = []
         self._lock = threading.Lock()
 
     def record(self, path: str) -> None:
@@ -290,6 +487,11 @@ class TargetApp:
     @property
     def requested_paths(self) -> list[str]:
         return list(self._server.requested)
+
+    @property
+    def accounts(self) -> list[dict[str, str]]:
+        """Accounts created through ``POST /register`` during the test."""
+        return list(self._server.accounts)
 
     def shutdown(self) -> None:
         self._server.shutdown()

@@ -41,6 +41,7 @@ __all__ = [
     "Authorization",
     "Scope",
     "ScopeLimits",
+    "ScopePermissions",
     "ScopeRule",
     "ScopeParseError",
     "normalize_host",
@@ -333,6 +334,49 @@ class ScopeLimits(BaseModel):
     max_requests_per_scan: int | None = Field(default=None, ge=1)
 
 
+class ScopePermissions(BaseModel):
+    """What the program allows beyond read-only probing.
+
+    Everything here is off by default and has to be turned on deliberately,
+    because each entry authorizes ReconX to leave something behind on a target
+    rather than only to look at it. A CLI flag is not enough on its own: the
+    permission lives in the scope file next to the attestation, so the record of
+    what you were allowed to do sits beside the record of who allowed it.
+    """
+
+    # Registering an account is the only way to *prove* that a self-registration
+    # endpoint bypasses an SSO boundary, and it writes a row the program then has
+    # to clean up. Off unless the program's rules permit account creation.
+    account_creation: bool = False
+    # Where a probe account's mail lands. Required for account_creation, so that
+    # every account ReconX creates is attributable to a mailbox you control and
+    # can be named in the report for deletion.
+    test_account_email: str | None = None
+
+    @field_validator("test_account_email")
+    @classmethod
+    def _looks_like_an_address(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        value = v.strip()
+        if not value:
+            return None
+        local, _, domain = value.partition("@")
+        if not local or "." not in domain or any(ch.isspace() for ch in value):
+            raise ValueError(f"not an email address: {v!r}")
+        return value
+
+    @model_validator(mode="after")
+    def _account_creation_needs_a_mailbox(self) -> ScopePermissions:
+        if self.account_creation and not self.test_account_email:
+            raise ValueError(
+                "permissions.account_creation requires permissions.test_account_email: "
+                "an account ReconX creates must be traceable to a mailbox you control, "
+                "so it can be named in the report and deleted afterwards"
+            )
+        return self
+
+
 class Scope(BaseModel):
     """A parsed, validated program scope."""
 
@@ -344,6 +388,7 @@ class Scope(BaseModel):
     in_scope: list[str] = Field(min_length=1)
     out_of_scope: list[str] = Field(default_factory=list)
     limits: ScopeLimits = Field(default_factory=ScopeLimits)
+    permissions: ScopePermissions = Field(default_factory=ScopePermissions)
 
     # Populated in the validator below.
     in_scope_rules: list[ScopeRule] = Field(default_factory=list, exclude=True)
