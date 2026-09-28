@@ -238,9 +238,7 @@ def parse_rule(raw: str) -> ScopeRule:
             # No meaningful path restriction: treat as a host rule.
             return _host_rule(entry, host)
         # A trailing "/*" means "this prefix and everything under it".
-        if path.endswith("/*"):
-            path = path[:-1]
-        elif path.endswith("*"):
+        if path.endswith("/*") or path.endswith("*"):
             path = path[:-1]
         return ScopeRule(raw=entry, kind="url", host=host, path_prefix=path or "/")
 

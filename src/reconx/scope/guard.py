@@ -17,8 +17,8 @@ Decision order is deliberate and not configurable:
 from __future__ import annotations
 
 from collections import Counter, deque
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Iterable
 from urllib.parse import urlsplit
 
 from reconx.scope.model import Scope, ScopeParseError, ScopeRule, normalize_host
