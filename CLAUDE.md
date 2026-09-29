@@ -55,6 +55,54 @@ program. `naabu` and `nmap` speak TCP and have no headers. A test asserts both t
 presence and the absence, and another asserts the flag reaches the executed argv
 rather than only the accessor.
 
+### 1c. A credential reaches the target and nothing else
+
+Authenticated scanning is configured by an `auth` block in the scope file
+(`scope/model.py::AuthConfig`), which declares the *shape* of a session and names
+the environment variable holding it. The scope file is checked in and it is the
+authorization record — the credential is never in it, and `credential_env`
+rejects a value that looks like a pasted secret rather than a variable name.
+
+Four containments, each with a test:
+
+| Place | Mechanism |
+|---|---|
+| Off-scope hosts | `ScopedHttpClient._with_session` attaches headers in `_send_with_retries`, which runs *after* `request()` has put that hop through the guard. Containment is the existing chokepoint, not a second rule |
+| `net/sources.py` | `SourceClient` takes no argument for a session, so no call can pass one |
+| Evidence and reproductions | `report/repro.py::redact` runs on the way *into* storage, so no unredacted copy exists for a future report format to leak |
+| `ToolResult.command` | argv is visible to `ps`; the process gets the real value, the recorded copy gets `$YOUR_SESSION` |
+
+`stages/vulns.py` passes `include_cookies=True` so a cookie-*borne payload*
+reproduces — then redacts the session out of the same header. The payload
+survives, the credential does not. `_with_session` merges `Cookie` for the same
+reason: replacing it would log the scan out for exactly the requests establishing
+a finding.
+
+`ToolSpec.identity_header_args` marks the tools whose traffic reaches the target,
+and that same set is the only one given a session. subfinder, amass, gau and dnsx
+stay unmarked, which now protects the credential as well as the handle. sqlmap's
+flag carries a value rather than a header line, so it reports `auth_unsupported`
+rather than silently running unauthenticated.
+
+**The session gate is the part that makes any of this trustworthy.** A scan whose
+session dies does not fail — every verifier finds nothing and the run reads as a
+clean scan of a well-built site. `verify/session.py` mirrors `verify/waf.py`:
+`SessionMonitor.check()` requires a marker the operator named, the orchestrator
+re-checks between stage levels, and `UNKNOWN` counts as obstruction because an
+unverifiable session is exactly where a dead one hides.
+
+**A logged-in crawler is not a reader.** `DESTRUCTIVE_PATH_MARKERS` in
+`scope/guard.py` refuses ~37 state-changing path patterns, but only while
+authenticated — unauthenticated, a GET of `/logout` does nothing and excluding it
+would hide real surface. Form and JSON parameters are not fuzzed while
+authenticated unless `fuzz_write_methods` is set, because a POST to an
+authenticated endpoint changes the operator's own data.
+
+`verify/xss.py` seeds the Playwright context. Without it the browser loads the
+sign-in page, the marker never runs, and a real finding is downgraded to Needs
+review blaming a Content-Security-Policy that does not exist — measured, and
+there is a test asserting Confirmed with seeding against Needs review without.
+
 ### 2. Two independent oracles, or it is not Confirmed
 
 `decide_from_oracles` in `src/reconx/verify/base.py` is the verification standard,

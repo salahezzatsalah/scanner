@@ -129,6 +129,7 @@ class ScopedHttpClient:
         request_budget: int | None = None,
         verify_target_tls: bool = False,
         client: httpx.AsyncClient | None = None,
+        session: Any = None,
     ) -> None:
         if not isinstance(guard, ScopeGuard):
             raise TypeError(
@@ -136,6 +137,12 @@ class ScopedHttpClient:
                 "checked against an authorized scope."
             )
         self._guard = guard
+        # An optional reconx.verify.session.SessionMonitor. Its headers are
+        # attached per hop, *after* the guard has allowed that hop, so a session
+        # can never ride a request to a host the scope does not cover -- including
+        # a redirect target. Containment comes from the existing chokepoint rather
+        # than from a second rule that could drift out of step with it.
+        self._session = session
         self._settings = settings or get_settings()
         self._max_redirects = max(0, max_redirects)
         self._audit_sink = audit_sink
@@ -358,6 +365,37 @@ class ScopedHttpClient:
         last_response.redirect_chain = list(chain)
         return last_response
 
+    def _with_session(
+        self, headers: Mapping[str, str] | None
+    ) -> Mapping[str, str] | None:
+        """Attach the session to one already-authorized hop.
+
+        Called from :meth:`_send_with_retries`, which runs only after
+        :meth:`request` has put this hop's URL through the guard. That ordering is
+        the containment: a redirect to a host the scope does not cover is refused
+        before it gets here, so the credential cannot follow it.
+
+        ``Cookie`` is merged rather than replaced. A verifier testing a
+        cookie-borne parameter sets its own ``Cookie`` header, and overwriting the
+        session with it would log the scan out for exactly the requests where a
+        finding was being established -- producing "not vulnerable" for the wrong
+        reason. The payload is appended last so it wins on a duplicate name.
+        """
+        session_headers = self._session.headers() if self._session is not None else {}
+        if not session_headers:
+            return headers
+        if not headers:
+            return session_headers
+
+        merged = {**session_headers}
+        for name, value in headers.items():
+            existing = merged.get(name)
+            if existing is not None and name.lower() == "cookie":
+                merged[name] = f"{existing}; {value}"
+            else:
+                merged[name] = value
+        return merged
+
     async def _send_with_retries(
         self,
         method: str,
@@ -375,6 +413,8 @@ class ScopedHttpClient:
         host = urlsplit(url).hostname or ""
         attempts = self._settings.max_retries + 1
         last_error: Exception | None = None
+        # The guard has already allowed this exact hop, so the session may ride it.
+        headers = self._with_session(headers)
 
         for attempt in range(1, attempts + 1):
             if self._budget is not None and self._requests_made >= self._budget:

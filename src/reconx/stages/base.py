@@ -99,18 +99,33 @@ class StageContext:
     # When false, every stage takes its pure-Python path. Useful for a
     # reproducible run, and required for hermetic tests.
     use_external_tools: bool = True
+    # A reconx.verify.session.SessionMonitor when the scope configures auth and
+    # the credential is in the environment. None means an unauthenticated scan,
+    # which is the default and needs no configuration.
+    session_monitor: Any = None
 
     def tool(self, name: str, **kwargs) -> ToolRunner | _DisabledRunner:
         """A scope-enforcing runner for a catalogued external tool.
 
         The operator's identity is passed to every runner, so traffic a tool sends
-        to the target is attributable to the same person the audit log names.
+        to the target is attributable to the same person the audit log names. When
+        a session is active it is passed the same way, to the same set of tools --
+        the ones ``ToolSpec.identity_header_args`` marks as reaching the target.
+        The passive tools stay unmarked, which now protects the credential as well
+        as the handle.
         """
         if not self.use_external_tools:
             return _DisabledRunner(get_spec(name))
         kwargs.setdefault("user_agent", self.settings.user_agent)
         kwargs.setdefault("identity_header", self.settings.identity_header)
+        if self.session_monitor is not None and self.session_monitor.configured:
+            kwargs.setdefault("auth_headers", self.session_monitor.headers())
         return get_runner(name, self.guard, **kwargs)
+
+    @property
+    def authenticated(self) -> bool:
+        """True when a usable session is configured for this scan."""
+        return self.session_monitor is not None and self.session_monitor.configured
 
     @property
     def target_domains(self) -> list[str]:

@@ -24,8 +24,11 @@ Out-of-scope rules always win over in-scope rules.
 from __future__ import annotations
 
 import ipaddress
+import os
 import re
+from collections.abc import Mapping
 from datetime import date
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -38,6 +41,8 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 _extract = tldextract.TLDExtract(suffix_list_urls=(), include_psl_private_domains=True)
 
 __all__ = [
+    "AuthConfig",
+    "AuthKind",
     "Authorization",
     "ScanOptions",
     "Scope",
@@ -209,6 +214,26 @@ class ScopeRule(BaseModel):
         return self.raw
 
 
+def _covered_by(
+    host: str,
+    path: str,
+    in_scope: list[ScopeRule],
+    out_of_scope: list[ScopeRule],
+) -> bool:
+    """Is this URL inside the scope these rules describe?
+
+    A deliberately small reimplementation of the precedence
+    :class:`~reconx.scope.guard.ScopeGuard` applies -- out-of-scope wins, then
+    in-scope -- because the guard imports this module and a scope must be able to
+    validate itself before one exists. It is used for exactly one decision: that
+    an ``auth.session_check_url`` cannot reach a host the scope does not cover.
+    Every runtime decision still goes through the guard.
+    """
+    if any(rule.matches_url(host, path) for rule in out_of_scope):
+        return False
+    return any(rule.matches_url(host, path) for rule in in_scope)
+
+
 def parse_rule(raw: str) -> ScopeRule:
     """Parse one scope entry into a :class:`ScopeRule`."""
     if raw is None:
@@ -334,6 +359,102 @@ class ScopeLimits(BaseModel):
     max_requests_per_scan: int | None = Field(default=None, ge=1)
 
 
+class AuthKind(StrEnum):
+    """How a session is presented to the target."""
+
+    COOKIE = "cookie"
+    HEADER = "header"
+    BEARER = "bearer"
+
+
+class AuthConfig(BaseModel):
+    """A session to scan with, declared here and held nowhere near here.
+
+    The scope file is checked into a repository and it is the authorization
+    record. A session cookie belongs in neither, so this block declares only the
+    *shape* of the session and names the environment variable that holds the
+    secret. ReconX reads that variable at run time and never writes the value
+    anywhere: not into the scope file, not into the database, not into a report.
+
+    ``session_check_url`` and ``session_check_marker`` are not optional
+    conveniences. A scan whose session expires halfway through does not fail --
+    it returns a pile of "no signal" results that look exactly like a clean scan,
+    which is worse than crashing. The marker is how that is caught.
+    """
+
+    #: The environment variable holding the credential. Never the credential.
+    credential_env: str = Field(min_length=1)
+    kind: AuthKind = AuthKind.COOKIE
+    #: Header name, for ``kind: header``. Ignored for cookie and bearer.
+    header_name: str = "Authorization"
+    #: A URL that answers differently when logged in. Must be in scope.
+    session_check_url: str = Field(min_length=1)
+    #: Text present only while the session is valid, e.g. "Sign out".
+    session_check_marker: str = Field(min_length=1)
+    #: Re-check the session between stages. Off only if the check itself is
+    #: expensive or rate-limited, and then the risk is yours.
+    recheck_between_stages: bool = True
+
+    # --- authenticated safety ------------------------------------------------
+    # An authenticated crawler finds /logout, /settings/delete-account and
+    # /billing/cancel, and presses them. These default on because an
+    # authenticated scanner that deletes the operator's own account, or emails a
+    # customer, is how researchers get banned.
+    avoid_state_changing_paths: bool = True
+    #: Extra path substrings to refuse while authenticated, beyond the built-ins.
+    extra_forbidden_paths: list[str] = Field(default_factory=list)
+    #: Fuzz form, JSON and other non-GET parameters while authenticated. Off by
+    #: default: a POST to an authenticated endpoint changes data.
+    fuzz_write_methods: bool = False
+
+    @field_validator("credential_env")
+    @classmethod
+    def _looks_like_an_env_var(cls, value: str) -> str:
+        name = value.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            raise ValueError(
+                f"{value!r} is not an environment variable name. This field names the "
+                "variable holding the credential; it must never hold the credential "
+                "itself."
+            )
+        return name
+
+    @field_validator("session_check_marker")
+    @classmethod
+    def _marker_is_specific(cls, value: str) -> str:
+        marker = value.strip()
+        if len(marker) < 3:
+            raise ValueError(
+                f"{value!r} is too short to distinguish a logged-in page from a "
+                "logged-out one. Use text that appears only while signed in."
+            )
+        return marker
+
+    def resolve_credential(self, environ: Mapping[str, str] | None = None) -> str:
+        """The credential, from the environment. Empty when unset."""
+        source = os.environ if environ is None else environ
+        return source.get(self.credential_env, "").strip()
+
+    def headers(self, credential: str) -> dict[str, str]:
+        """The request headers this session is carried in."""
+        if not credential:
+            return {}
+        if self.kind is AuthKind.COOKIE:
+            return {"Cookie": credential}
+        if self.kind is AuthKind.BEARER:
+            return {"Authorization": f"Bearer {credential}"}
+        return {self.header_name: credential}
+
+    def describe(self, environ: Mapping[str, str] | None = None) -> str:
+        """A human-readable status that never includes the credential."""
+        present = bool(self.resolve_credential(environ))
+        state = "set" if present else "NOT SET"
+        return (
+            f"{self.kind.value} session from ${self.credential_env} ({state}), "
+            f"checked against {self.session_check_url} for {self.session_check_marker!r}"
+        )
+
+
 class ScanOptions(BaseModel):
     """How this program is scanned, stored with the scope that authorizes it.
 
@@ -408,6 +529,8 @@ class Scope(BaseModel):
     out_of_scope: list[str] = Field(default_factory=list)
     limits: ScopeLimits = Field(default_factory=ScopeLimits)
     scan_options: ScanOptions = Field(default_factory=ScanOptions)
+    #: A session to scan with. Absent means unauthenticated scanning.
+    auth: AuthConfig | None = None
 
     # Populated in the validator below.
     in_scope_rules: list[ScopeRule] = Field(default_factory=list, exclude=True)
@@ -435,6 +558,26 @@ class Scope(BaseModel):
 
         object.__setattr__(self, "in_scope_rules", compiled_in)
         object.__setattr__(self, "out_of_scope_rules", compiled_out)
+
+        # A session check that reaches a host this scope does not cover would send
+        # the credential to a third party, which is a leak by construction. This
+        # is checked here rather than at request time because a scope that could
+        # do it should not load at all.
+        if self.auth is not None:
+            parts = urlsplit(self.auth.session_check_url)
+            check_host = parts.hostname
+            if not check_host:
+                raise ValueError(
+                    f"auth.session_check_url {self.auth.session_check_url!r} names no "
+                    "host; it must be an absolute URL"
+                )
+            if not _covered_by(check_host, parts.path or "/", compiled_in, compiled_out):
+                raise ValueError(
+                    f"auth.session_check_url points at {check_host!r}, which this scope "
+                    "does not cover. Checking a session against an out-of-scope host "
+                    "would send the credential somewhere you are not authorized to "
+                    "send it."
+                )
         return self
 
     @property

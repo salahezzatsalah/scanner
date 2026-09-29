@@ -12,6 +12,14 @@ Decision order is deliberate and not configurable:
    behaves the way a program means it.
 2. Otherwise, if any in-scope rule matches, the target is **allowed**.
 3. Otherwise the target is **denied**. Absence of a rule is never permission.
+
+There is a fourth rule that applies only to an **authenticated** scan, and it sits
+ahead of the other three: a path that changes state is denied. A logged-in crawler
+is not a reader, it is something acting as the operator, and it will find
+``/logout``, ``/settings/delete-account`` and ``/billing/cancel`` and follow them.
+It lives here rather than in a stage so that every channel inherits it from the one
+chokepoint, and it is off for unauthenticated scans, where a GET of ``/logout``
+does nothing and hiding it would hide real surface.
 """
 
 from __future__ import annotations
@@ -23,9 +31,67 @@ from urllib.parse import urlsplit
 
 from reconx.scope.model import Scope, ScopeParseError, ScopeRule, normalize_host
 
-__all__ = ["ScopeDecision", "ScopeGuard", "OutOfScopeError"]
+__all__ = [
+    "DESTRUCTIVE_PATH_MARKERS",
+    "ScopeDecision",
+    "ScopeGuard",
+    "OutOfScopeError",
+]
 
 _MAX_BLOCKED_SAMPLES = 200
+
+# Path substrings that name an action rather than a page. Refused while
+# authenticated, because following one as the logged-in operator does the thing.
+#
+# Chosen to be specific enough not to swallow real surface: "delete" is here but
+# "deleted" would also match, which is the intended trade -- a false refusal costs
+# one endpoint, and a false permission costs the operator's account. Anything more
+# aggressive belongs in a program's own `extra_forbidden_paths`.
+DESTRUCTIVE_PATH_MARKERS: tuple[str, ...] = (
+    # ending the session, which would silently turn the rest of the scan
+    # unauthenticated -- the exact failure verify/session.py exists to catch
+    "/logout",
+    "/signout",
+    "/sign-out",
+    "/log-out",
+    "/session/destroy",
+    # destroying things
+    "/delete",
+    "/destroy",
+    "/remove",
+    "/purge",
+    "/wipe",
+    "/revoke",
+    "/deactivate",
+    "/close-account",
+    "/cancel",
+    "/unsubscribe",
+    # credentials and identity, where a change locks the operator out
+    "/change-password",
+    "/reset-password",
+    "/forgot-password",
+    "/change-email",
+    "/verify-email",
+    "/2fa",
+    "/mfa",
+    "/api-keys",
+    "/rotate",
+    # money
+    "/billing",
+    "/payment",
+    "/checkout",
+    "/refund",
+    "/payout",
+    "/subscription",
+    "/invoice",
+    # reaching other people, which is the one mistake a program cannot undo
+    "/invite",
+    "/send",
+    "/notify",
+    "/broadcast",
+    "/export",
+    "/import",
+)
 
 
 @dataclass(frozen=True)
@@ -77,10 +143,34 @@ class ScopeGuard:
     thousand candidate subdomains costs one decision per distinct host.
     """
 
-    def __init__(self, scope: Scope) -> None:
+    def __init__(self, scope: Scope, *, authenticated: bool = False) -> None:
         self._scope = scope
         self._host_cache: dict[str, ScopeDecision] = {}
         self.stats = GuardStats()
+        # Authenticated scanning turns a crawler into something that can act as
+        # the operator. The deny list below applies only in that state, because
+        # unauthenticated GETs of /logout and /delete do nothing and excluding
+        # them would hide real surface.
+        self._authenticated = authenticated
+        self._forbidden_paths = self._build_forbidden_paths(scope, authenticated)
+
+    @staticmethod
+    def _build_forbidden_paths(scope: Scope, authenticated: bool) -> tuple[str, ...]:
+        auth = getattr(scope, "auth", None)
+        if not authenticated or auth is None or not auth.avoid_state_changing_paths:
+            return ()
+        return tuple(
+            sorted({*DESTRUCTIVE_PATH_MARKERS, *(m.lower() for m in auth.extra_forbidden_paths)})
+        )
+
+    @property
+    def authenticated(self) -> bool:
+        return self._authenticated
+
+    @property
+    def forbidden_paths(self) -> tuple[str, ...]:
+        """Path substrings refused while authenticated. Empty when not."""
+        return self._forbidden_paths
 
     # -- properties -------------------------------------------------------
 
@@ -158,6 +248,25 @@ class ScopeGuard:
                 ScopeDecision(url, False, f"unparseable host ({exc})", level="url")
             )
         path = parts.path or "/"
+
+        # Checked before the in-scope rules, and alongside the out-of-scope ones,
+        # because it is the same kind of statement: a place this scan must not go.
+        # Only populated while authenticated.
+        if self._forbidden_paths:
+            lowered = path.lower()
+            for marker in self._forbidden_paths:
+                if marker in lowered:
+                    return self._record(
+                        ScopeDecision(
+                            url,
+                            False,
+                            f"the path contains {marker!r}, which changes state, and "
+                            "this scan is authenticated. Set "
+                            "auth.avoid_state_changing_paths: false to test it",
+                            f"authenticated deny: {marker}",
+                            "url",
+                        )
+                    )
 
         for rule in self._scope.out_of_scope_rules:
             if rule.matches_url(host, path):

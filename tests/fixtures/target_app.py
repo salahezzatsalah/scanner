@@ -63,6 +63,7 @@ _HOME = """<!doctype html><html><head><title>Example Corp</title></head>
 <body><h1>Welcome to Example Corp</h1>
 <p>We sell examples. Browse our <a href="/products">products</a> or
 <a href="/admin">sign in</a>.</p>
+<p><a href="/account">My account</a> &middot; <a href="/login">Sign in</a></p>
 <p>Popular: <a href="/sqli?id=1">Widget</a> &middot;
 <a href="/static-error?id=1">Gadget</a> &middot;
 <a href="/attr?q=blue">Filter by colour</a> &middot;
@@ -131,6 +132,21 @@ _PASSWD_FILE = (
 # page happening to contain a signature.
 _GROUP_FILE = "root:x:0:\nadm:x:4:syslog\nwww-data:x:33:\n"
 
+# What an unauthenticated request to the gated surface gets. Deliberately carries
+# a password field and no session marker, so the logged-out heuristic in
+# reconx.verify.session recognises it.
+_SIGN_IN_PAGE = """<!doctype html><html><head><title>Sign in</title></head>
+<body><h1>Please sign in to continue</h1>
+<form method="post" action="/login"><input name="user">
+<input name="pass" type="password"></form></body></html>"""
+
+# The signed-in account page. Carries the session marker.
+_ACCOUNT_PAGE = """<!doctype html><html><head><title>Your account</title></head>
+<body><h1>Your account</h1>
+<p>Recent orders: <a href="/account/orders?ref=A-1001">A-1001</a></p>
+<p><a href="/account/fake-gate">Preferences</a></p>
+<p><a href="/logout">Sign out</a></p></body></html>"""
+
 _JS_FILE = """// app.js
 const API_BASE = "/api/v1";
 fetch(API_BASE + "/users");
@@ -184,6 +200,10 @@ class _Handler(BaseHTTPRequestHandler):
     def _one(params: dict[str, list[str]], name: str, default: str = "") -> str:
         values = params.get(name) or []
         return values[0] if values else default
+
+    def _signed_in(self) -> bool:
+        """Does this request carry a session the fixture still honours?"""
+        return self.server.accepts(self.headers.get("Cookie") or "")  # type: ignore[attr-defined]
 
     # -- surrogates for the classes that need one -------------------------
 
@@ -509,6 +529,58 @@ class _Handler(BaseHTTPRequestHandler):
             del params
             self._send(200, self._server_side_fetch(f"http://127.0.0.1:{self.server.server_address[1]}/robots.txt", forced=True))
 
+        # === the authenticated surface ====================================
+        # Everything under /account needs the session. A scanner without one sees
+        # the sign-in page, which is the whole reason authenticated scanning
+        # exists: on a mature program this is where the unswept surface is.
+        elif path == "/login":
+            self._send(
+                200,
+                "<!doctype html><html><head><title>Sign in</title></head><body>"
+                '<form method="post" action="/login">'
+                '<input name="user"><input name="pass" type="password">'
+                "</form></body></html>",
+            )
+        elif path == "/account":
+            if not self._signed_in():
+                self._send(200, _SIGN_IN_PAGE)
+            else:
+                self._send(200, _ACCOUNT_PAGE)
+        # A real bug that only exists behind the login. Reflects unencoded into
+        # the body exactly as /xss does, but is unreachable unless signed in, so a
+        # test can assert auth found what unauthenticated scanning could not.
+        elif path == "/account/orders":
+            if not self._signed_in():
+                self._send(200, _SIGN_IN_PAGE)
+            else:
+                value = self._one(params, "ref")
+                self._send(
+                    200,
+                    "<!doctype html><html><head><title>Order</title></head><body>"
+                    f"<h1>Order {value}</h1><p>Shipped.</p>"
+                    f'<a href="/logout">{self.server.SESSION_MARKER}</a>'  # type: ignore[attr-defined]
+                    "</body></html>",
+                )
+        # Trap: sits under /account and answers 200, but behaves identically with
+        # or without the session. "I got a 200 while logged in" is not a finding,
+        # and a scanner that reports gated-looking pages will report this one.
+        elif path == "/account/fake-gate":
+            self._send(
+                200,
+                "<!doctype html><html><head><title>Preferences</title></head><body>"
+                "<h1>Public preferences</h1><p>No account required.</p></body></html>",
+            )
+        # The dangerous action. A logged-in crawler that follows this ends its own
+        # session and silently turns the rest of the scan unauthenticated, which is
+        # why ScopeGuard refuses it while authenticated. No test should ever see
+        # this recorded.
+        elif path == "/logout":
+            self._send(
+                200,
+                "<!doctype html><html><head><title>Signed out</title></head><body>"
+                "<h1>You have been signed out</h1></body></html>",
+            )
+
         # --- trap: a SQL error string that is always present ---------------
         elif path == "/static-error":
             self._send(200, _STATIC_ERROR % html.escape(self._one(params, "id", "1")))
@@ -531,9 +603,31 @@ class _Handler(BaseHTTPRequestHandler):
         self.do_GET()
 
     def do_POST(self) -> None:  # noqa: N802
+        parts = urlsplit(self.path)
+        path = parts.path.rstrip("/") or "/"
         length = int(self.headers.get("Content-Length") or 0)
-        if length:
-            self.rfile.read(length)
+        body = self.rfile.read(length).decode("latin-1") if length else ""
+        self.server.record(f"POST {path}")  # type: ignore[attr-defined]
+
+        # Signing in by hand is how a researcher gets a session: ReconX is handed
+        # one, it never submits credentials itself.
+        if path == "/login":
+            if "user=" in body and "pass=" in body:
+                payload = b"<html><title>Welcome</title><body>Signed in.</body></html>"
+                self.send_response(302)
+                self.send_header(
+                    "Set-Cookie",
+                    f"{self.server.SESSION_COOKIE}; Path=/; HttpOnly",  # type: ignore[attr-defined]
+                )
+                self.send_header("Location", "/account")
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            self._send(401, "<html><title>Sign in</title><body>Bad credentials</body></html>")
+            return
+
         self._send(200, "<html><title>Accepted</title><body>ok</body></html>")
 
 
@@ -541,14 +635,38 @@ class _Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
+    #: The session value the authenticated surface accepts. Fixed rather than
+    #: random so a test can assert it never appears in stored evidence.
+    SESSION_VALUE = "rx-fixture-session-DO-NOT-STORE"
+    SESSION_COOKIE = f"rxsession={SESSION_VALUE}"
+    #: Present only on the signed-in account page, for the session check.
+    SESSION_MARKER = "Sign out"
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.requested: list[str] = []
         self._lock = threading.Lock()
+        # Authenticated requests served so far. Used only by expire_after.
+        self.authenticated_requests = 0
+        # When set, the session stops being honoured after this many
+        # authenticated requests, which is how the session gate gets tested. A
+        # session that dies mid-scan is the failure mode that produces a run full
+        # of logged-out results looking exactly like a clean scan.
+        self.expire_after: int | None = None
 
     def record(self, path: str) -> None:
         with self._lock:
             self.requested.append(path)
+
+    def accepts(self, cookie_header: str) -> bool:
+        """Is this request signed in? Honours expire_after."""
+        if self.SESSION_VALUE not in (cookie_header or ""):
+            return False
+        with self._lock:
+            self.authenticated_requests += 1
+            if self.expire_after is not None:
+                return self.authenticated_requests <= self.expire_after
+        return True
 
 
 class TargetApp:
@@ -576,6 +694,36 @@ class TargetApp:
     @property
     def requested_paths(self) -> list[str]:
         return list(self._server.requested)
+
+    # -- the authenticated surface ----------------------------------------
+
+    @property
+    def session_cookie(self) -> str:
+        """A ``Cookie`` header value the gated routes accept."""
+        return self._server.SESSION_COOKIE
+
+    @property
+    def session_value(self) -> str:
+        """The secret alone, for asserting it never reaches storage."""
+        return self._server.SESSION_VALUE
+
+    @property
+    def session_marker(self) -> str:
+        """Text present only on the signed-in page."""
+        return self._server.SESSION_MARKER
+
+    def expire_session_after(self, requests: int) -> None:
+        """Stop honouring the session after this many authenticated requests.
+
+        The silent-failure case: a scan that loses its session does not error, it
+        returns logged-out results that look like a clean scan. This is how the
+        session gate is proved to catch it.
+        """
+        self._server.expire_after = requests
+
+    @property
+    def authenticated_requests(self) -> int:
+        return self._server.authenticated_requests
 
     def shutdown(self) -> None:
         self._server.shutdown()

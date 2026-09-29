@@ -263,7 +263,9 @@ async def build_html_report(
         for signal in finding.signals or []:
             add(f'<span class="tag">{_esc(signal)}</span>')
         if finding.tested_while_throttled:
-            add('<span class="tag probable">host was throttling</span>')
+            # Covers a throttling host and an expired session alike: measured in a
+            # state where the result cannot be trusted. The description says which.
+            add('<span class="tag probable">measured in an unreliable state</span>')
         add("</div>")
         add(f"<h3>{_esc(finding.title)}</h3>")
         if finding.description:

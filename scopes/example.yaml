@@ -87,3 +87,57 @@ scan_options:
 
   # Ports for the resolve/probe stage. Empty means the built-in set.
   ports: []
+
+# ---------------------------------------------------------------------------
+# Scanning behind a login. Optional, and off unless this block is present.
+#
+# On a mature program the unauthenticated surface has been swept by hundreds of
+# researchers. The bugs are behind the login, which is why this exists.
+#
+# The credential is NEVER in this file. This file is checked into a repository
+# and it is your authorization record; a session cookie belongs in neither. The
+# block below declares the *shape* of the session and names the environment
+# variable holding it:
+#
+#   export RECONX_AUTH_ACME='session=abc123...'
+#
+# `reconx scope validate` then reports whether that variable is set, never what
+# is in it. Everything ReconX stores -- evidence rows, curl reproductions, the
+# audit log, every report format -- has the session stripped out on the way in
+# and replaced with $YOUR_SESSION.
+#
+# ReconX does not log in for you. Sign in with a browser, copy the session, and
+# export it. Scripted credential submission is how a scanner locks an account
+# out, and it buys nothing.
+# ---------------------------------------------------------------------------
+# auth:
+#   credential_env: "RECONX_AUTH_ACME"
+#   kind: cookie                 # cookie | header | bearer
+#   header_name: "Authorization" # only for kind: header
+#
+#   # A URL that answers differently signed in, and text that appears only when
+#   # it is. NOT optional, and it must be in scope -- a session check against an
+#   # off-scope host would hand the credential to a stranger, so the scope will
+#   # refuse to load.
+#   #
+#   # This is the most important field here. A session that expires mid-scan does
+#   # not fail: every verifier afterwards finds nothing, and the run looks exactly
+#   # like a clean scan of a well-built site. The marker is how that is caught,
+#   # and findings gathered after it disappears become Needs review rather than
+#   # being reported as clean.
+#   session_check_url: "https://app.acme.com/account"
+#   session_check_marker: "Sign out"
+#   recheck_between_stages: true
+#
+#   # A logged-in crawler is not a reader. It will find /logout,
+#   # /settings/delete-account and /billing/cancel, and follow them as you.
+#   # These defaults refuse ~37 state-changing path patterns while authenticated
+#   # and leave them testable when not, since an anonymous GET of /logout does
+#   # nothing. `reconx scope validate` lists what this turns off.
+#   avoid_state_changing_paths: true
+#   extra_forbidden_paths: []     # e.g. ["/run-payroll"]
+#
+#   # Fuzzing a form or JSON parameter means sending a POST, and a POST to an
+#   # authenticated endpoint changes your own data: it places an order, sends a
+#   # message, updates a profile. Off by default; turn it on deliberately.
+#   fuzz_write_methods: false

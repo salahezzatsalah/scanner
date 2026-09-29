@@ -50,6 +50,7 @@ from reconx.stages.ports import PortStage
 from reconx.stages.resolve_probe import ResolveProbeStage
 from reconx.stages.subdomains import SubdomainStage
 from reconx.stages.vulns import VulnStage
+from reconx.verify.session import SessionMonitor
 
 __all__ = [
     "STAGE_REGISTRY",
@@ -220,6 +221,10 @@ class RunSummary:
     out_of_scope_blocked: int = 0
     source_calls: int = 0
     error: str | None = None
+    #: Run-level observations that belong to no single stage, such as the state of
+    #: the session the scan ran under.
+    notes: list[str] = field(default_factory=list)
+    session: dict[str, Any] = field(default_factory=dict)
 
     @property
     def new_assets(self) -> list[str]:
@@ -270,6 +275,10 @@ class RunSummary:
             "total_filtered": self.total_filtered,
             "stages": {name: result.as_dict() for name, result in self.stages.items()},
             "skipped": dict(self.skipped),
+            "notes": list(self.notes),
+            # The session state, never the credential: SessionMonitor.summary()
+            # reports whether one was configured and what the last check found.
+            "session": dict(self.session),
             "error": self.error,
         }
 
@@ -289,7 +298,12 @@ class Orchestrator:
         self._scope = scope
         self._scope_yaml = scope_yaml or f"program: {scope.program}"
         self._settings = settings or get_settings()
-        self._guard = ScopeGuard(scope)
+        # Resolved here, before the guard, because whether a session is available
+        # decides whether the guard refuses state-changing paths. Reading the
+        # environment is cheap and pure, and the monitor keeps the value out of
+        # its own repr.
+        self._session_monitor = SessionMonitor.from_scope(scope)
+        self._guard = ScopeGuard(scope, authenticated=self._session_monitor.configured)
         self._overrides = stage_instances or {}
         options = scope.scan_options
         # An explicit argument wins, then the scope's own option, then on.
@@ -337,13 +351,52 @@ class Orchestrator:
                 status=RunStatus.RUNNING,
             )
 
-            http = ScopedHttpClient(self._guard, settings=self._settings)
+            # Built in __init__ so the guard could be told. An unauthenticated scan
+            # still gets a monitor, in NOT_CONFIGURED state, so every stage can ask
+            # the same question without a special case.
+            session_monitor = self._session_monitor
+            http = ScopedHttpClient(
+                self._guard, settings=self._settings, session=session_monitor
+            )
             dns = ScopedResolver(self._guard, settings=self._settings)
+            # SourceClient is built without the monitor, and takes no argument for
+            # one. crt.sh and VirusTotal are third parties outside the program, so
+            # the credential must be structurally unable to reach them rather than
+            # merely not passed by accident today.
             sources = SourceClient(settings=self._settings)
             shared: dict[str, Any] = {}
 
+            if session_monitor.configured:
+                verdict = await session_monitor.check(http)
+                summary.notes.append(
+                    f"authenticated scan: {verdict.explain()}"
+                )
+                if not verdict.active:
+                    # Starting a scan with a session that is already dead produces
+                    # a run full of logged-out results that read as clean. Say so
+                    # loudly at the top rather than letting it be discovered later.
+                    summary.notes.append(
+                        "the session was not valid before the scan began, so these "
+                        "results describe the unauthenticated surface only"
+                    )
+
             try:
                 for level in levels:
+                    # Between levels, not inside them: a session does not expire
+                    # per-parameter, and a check per verifier would cost more
+                    # requests than the verifiers do.
+                    if (
+                        session_monitor.configured
+                        and session_monitor.auth is not None
+                        and session_monitor.auth.recheck_between_stages
+                        and session_monitor.checks
+                    ):
+                        recheck = await session_monitor.check(http)
+                        if not recheck.active:
+                            note = f"session check before {', '.join(level)}: {recheck.explain()}"
+                            if note not in summary.notes:
+                                summary.notes.append(note)
+
                     await self._run_level(
                         level=level,
                         completed=completed,
@@ -355,6 +408,7 @@ class Orchestrator:
                         dns=dns,
                         sources=sources,
                         shared=shared,
+                        session_monitor=session_monitor,
                     )
 
                 summary.status = RunStatus.FAILED if summary.error else RunStatus.COMPLETED
@@ -367,6 +421,9 @@ class Orchestrator:
                 summary.dns_queries = dns.queries
                 summary.out_of_scope_blocked = self._guard.stats.blocked
                 summary.source_calls = sources.calls
+                # Recorded on the run so a report can say which surface these
+                # results describe. A scan whose session died is not a clean scan.
+                summary.session = session_monitor.summary()
 
                 await write_audit_entries(
                     session,
@@ -438,6 +495,7 @@ class Orchestrator:
         dns: ScopedResolver,
         sources: SourceClient,
         shared: dict[str, Any],
+        session_monitor: Any = None,
     ) -> None:
         """Run one dependency level, skipping stages whose inputs are missing."""
         runnable: list[str] = []
@@ -494,6 +552,7 @@ class Orchestrator:
                 dns=dns,
                 sources=sources,
                 shared=shared,
+                session_monitor=session_monitor,
             )
             for name in runnable
         ]
@@ -525,6 +584,7 @@ class Orchestrator:
         dns: ScopedResolver,
         sources: SourceClient,
         shared: dict[str, Any],
+        session_monitor: Any = None,
     ) -> StageResult:
         """Run one stage in its own database session.
 
@@ -552,6 +612,7 @@ class Orchestrator:
                 checkpoint=dict(stage_run.checkpoint or {}),
                 shared=shared,
                 use_external_tools=self._use_external_tools,
+                session_monitor=session_monitor,
             )
 
             try:

@@ -242,6 +242,11 @@ class Finding(SQLModel, table=True):
     signals: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     reproduced_count: int = Field(default=0)
     attempt_count: int = Field(default=0)
+    # True when this was measured in a state where results cannot be trusted:
+    # the host was blocking or throttling, or the scan's session had expired. Both
+    # produce the same problem for a reader, so they share a flag and the
+    # description names the specific cause. Kept under the original name because
+    # renaming a column costs a migration and buys nothing.
     tested_while_throttled: bool = Field(default=False)
 
     detector: str = Field(default="", max_length=120)

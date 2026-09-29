@@ -325,6 +325,33 @@ def scope_validate(
         f"max {limits.max_concurrent_hosts or 'default'} hosts, "
         f"budget {limits.max_requests_per_scan or 'unlimited'} requests"
     )
+    if scope.auth is not None:
+        auth = scope.auth
+        # Says whether the variable is set, never what is in it.
+        console.print(f"\nAuthenticated scanning: [bold]{auth.describe()}[/bold]")
+        if not auth.resolve_credential():
+            console.print(
+                f"[yellow]${auth.credential_env} is not set, so this scan would run "
+                "unauthenticated.[/yellow] Export the session before scanning."
+            )
+        if auth.avoid_state_changing_paths:
+            console.print(
+                "[dim]State-changing paths (logout, delete, password, billing) will be "
+                "refused while authenticated. Set avoid_state_changing_paths: false to "
+                "test them deliberately.[/dim]"
+            )
+        if not auth.fuzz_write_methods:
+            console.print(
+                "[dim]Form and JSON parameters will not be fuzzed while "
+                "authenticated, because a write to an authenticated endpoint changes "
+                "data. Set fuzz_write_methods: true to include them.[/dim]"
+            )
+    else:
+        console.print(
+            "\n[dim]Unauthenticated. On a mature program most of the surface is behind "
+            "a login; add an 'auth' block to reach it.[/dim]"
+        )
+
     console.print(
         f"\n[green]Scope is valid.[/green] {len(scope.in_scope_rules)} in-scope "
         f"rule(s), {len(scope.out_of_scope_rules)} exclusion(s)."

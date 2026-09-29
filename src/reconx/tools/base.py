@@ -20,7 +20,7 @@ import os
 import re
 import shutil
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -263,6 +263,7 @@ class ToolRunner:
         env: dict[str, str] | None = None,
         user_agent: str = "",
         identity_header: str = "User-Agent",
+        auth_headers: Mapping[str, str] | None = None,
     ) -> None:
         if not isinstance(guard, ScopeGuard):
             raise TypeError(
@@ -275,6 +276,10 @@ class ToolRunner:
         self._env = env
         self._user_agent = user_agent.strip()
         self._identity_header = identity_header.strip() or "User-Agent"
+        # A session, for the tools that reach the target. Held here and never
+        # logged: ToolResult.command is redacted before it leaves _exec, because
+        # argv is visible to anyone who can run ps.
+        self._auth_headers = dict(auth_headers or {})
         # Set once a candidate has passed the identity check.
         self._resolved_path: str | None = None
         self._resolution_attempted = False
@@ -445,7 +450,7 @@ class ToolRunner:
         return result
 
     def identity_args(self) -> list[str]:
-        """Arguments that make this tool's traffic attributable to the operator.
+        """Headers this tool sends to the target: who we are, and our session.
 
         A program that permits automated testing almost always also requires the
         traffic to be identifiable, so it can tell research from an attack. Before
@@ -454,16 +459,50 @@ class ToolRunner:
         the volume on a wildcard program -- went out with their own defaults. The
         audit log said one thing and the target saw another.
 
-        Returns an empty list when no user agent is configured, or when the tool
-        does not speak HTTP to the target.
+        ``ToolSpec.identity_header_args`` marks the tools whose traffic reaches the
+        target, and that same set is the only one a session is given. subfinder,
+        amass, gau and dnsx are unmarked because they ask third parties *about* the
+        target: handing them a handle announces it to crt.sh, and handing them a
+        session cookie would be very much worse.
+
+        Returns an empty list when there is nothing to send, or when the tool does
+        not speak HTTP to the target.
         """
-        if not self._user_agent or self._spec.identity_header_args is None:
+        if self._spec.identity_header_args is None:
             return []
         flag, template = self._spec.identity_header_args
-        return [
-            flag,
-            template.format(header=self._identity_header, value=self._user_agent),
-        ]
+
+        pairs: list[tuple[str, str]] = []
+        if self._user_agent:
+            pairs.append((self._identity_header, self._user_agent))
+        # sqlmap's flag carries a value rather than a header line, so it can only
+        # express the user agent. A session for it would need its own flag, and
+        # silently dropping it is safer than silently sending an unauthenticated
+        # scan that reads as clean -- so it is reported instead.
+        if self._auth_headers and template == "{value}":
+            self._auth_unsupported = True
+        else:
+            pairs.extend(self._auth_headers.items())
+
+        args: list[str] = []
+        for header, value in pairs:
+            args.extend([flag, template.format(header=header, value=value)])
+        return args
+
+    @property
+    def auth_unsupported(self) -> bool:
+        """True when a session was supplied that this tool's flag cannot carry."""
+        return getattr(self, "_auth_unsupported", False)
+
+    def _redact(self, text: str | None) -> str | None:
+        """Strip the session out of anything that leaves this runner."""
+        if not text or not self._auth_headers:
+            return text
+        out = text
+        for value in sorted(self._auth_headers.values(), key=len, reverse=True):
+            if value:
+                out = out.replace(value, "$YOUR_SESSION")
+        return out
 
     async def _exec(
         self, argv: Sequence[str], *, stdin_data: str | None, timeout: float | None
@@ -492,7 +531,7 @@ class ToolRunner:
                 returncode=-1,
                 duration_s=time.monotonic() - started,
                 timed_out=True,
-                command=list(argv),
+                command=self._safe_command(argv),
                 stderr=f"timed out after {limit:.0f}s",
             )
 
@@ -500,7 +539,16 @@ class ToolRunner:
             tool=self._spec.name,
             returncode=process.returncode if process.returncode is not None else -1,
             stdout=stdout.decode("utf-8", errors="replace"),
-            stderr=stderr.decode("utf-8", errors="replace"),
+            stderr=self._redact(stderr.decode("utf-8", errors="replace")) or "",
             duration_s=time.monotonic() - started,
-            command=list(argv),
+            command=self._safe_command(argv),
         )
+
+    def _safe_command(self, argv: Sequence[str]) -> list[str]:
+        """The command as recorded: real arguments, no credential.
+
+        ``ToolResult.command`` is surfaced in stage notes and error text. The
+        process itself needs the real value, so redaction happens on the copy that
+        is kept rather than on the one that runs.
+        """
+        return [self._redact(part) or "" for part in argv]

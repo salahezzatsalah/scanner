@@ -37,9 +37,9 @@ from urllib.parse import urlsplit
 
 from sqlmodel import select
 
-from reconx.db.models import Asset, Endpoint, FindingTier, Severity
+from reconx.db.models import Asset, Endpoint, Finding, FindingTier, Severity
 from reconx.db.store import add_evidence, upsert_finding
-from reconx.report.repro import curl_command
+from reconx.report.repro import SESSION_PLACEHOLDER, curl_command, redact
 from reconx.stages.base import Stage, StageContext, StageResult
 from reconx.tools.base import ToolNotAvailable
 from reconx.triage.priority import compute_priority
@@ -157,12 +157,16 @@ def _build_sqli(stage: VulnStage, ctx: StageContext, _collab) -> SqliVerifier:
 
 
 def _build_xss(stage: VulnStage, ctx: StageContext, _collab) -> XssVerifier:
+    monitor = getattr(ctx, "session_monitor", None)
     return XssVerifier(
         ctx.http,
         attempts=ctx.settings.reproduce_attempts,
         required=ctx.settings.reproduce_required,
         headless_confirm=stage._headless_xss and ctx.settings.headless_xss_confirm,
         chromium_path=ctx.settings.chromium_path,
+        # The browser needs the session too, or an authenticated finding is
+        # downgraded because the page it loaded was the login form.
+        session_headers=monitor.headers() if monitor is not None else None,
     )
 
 
@@ -386,12 +390,62 @@ class VulnStage(Stage):
         if any(self._enabled.values()):
             await self._parameter_checks(ctx, result)
 
+        await self._recheck_session(ctx, result)
+
         result.items_out = self._surfaced
         result.note(
             "only Confirmed and Probable findings surface by default; discarded "
             "candidates are kept with their reason so the filter can be checked"
         )
         return result
+
+    async def _recheck_session(self, ctx: StageContext, result: StageResult) -> None:
+        """If the session died during this stage, say so on the findings.
+
+        An expired session produces **false negatives**, not false positives: the
+        verifiers were testing a logged-out application, so "not vulnerable" means
+        "not vulnerable to an anonymous visitor" and nothing more. A Confirmed
+        finding is still confirmed -- a bug that reproduced, reproduced.
+
+        So the discards are what get promoted to Needs review. Leaving them as
+        discards is the failure this whole gate exists to prevent: a scan that
+        silently lost its session, reporting an empty result that looks exactly
+        like a clean one.
+        """
+        monitor = getattr(ctx, "session_monitor", None)
+        if monitor is None or not monitor.configured:
+            return
+
+        verdict = await monitor.check(ctx.http)
+        if verdict.active:
+            return
+
+        rows = await ctx.session.execute(
+            select(Finding).where(
+                Finding.program_id == ctx.program_id,
+                Finding.scan_run_id == ctx.scan_run_id,
+                Finding.tier == FindingTier.DISCARDED,
+            )
+        )
+        affected = rows.scalars().all()
+        for finding in affected:
+            finding.tier = FindingTier.NEEDS_REVIEW
+            finding.tested_while_throttled = True
+            finding.discard_reason = None
+            finding.description = (
+                f"{finding.description or ''}\n\nThis was discarded while the scan "
+                f"was not signed in: {verdict.explain()} So it means only that an "
+                "anonymous visitor could not reach it. Refresh the credential and "
+                "re-run before treating it as clean."
+            ).strip()
+            ctx.session.add(finding)
+        await ctx.session.flush()
+
+        result.note(
+            f"the session was not valid at the end of this stage ({verdict.state.value}), "
+            f"so {len(affected)} discarded candidate(s) became Needs review: they were "
+            "tested against a logged-out application"
+        )
 
     # -- subdomain takeover -------------------------------------------------
 
@@ -630,6 +684,10 @@ class VulnStage(Stage):
             result.note("no parameters to test; run the params stage first")
             return
 
+        parameters = self._allowed_parameters(ctx, parameters, result)
+        if not parameters:
+            return
+
         collaborator: LocalCollaborator | None = None
         try:
             for check in PARAMETER_CHECKS:
@@ -670,6 +728,52 @@ class VulnStage(Stage):
         finally:
             if collaborator is not None:
                 await collaborator.stop()
+
+    def _allowed_parameters(
+        self, ctx: StageContext, parameters: list[dict], result: StageResult
+    ) -> list[dict]:
+        """Drop parameters this scan must not fuzz.
+
+        Two filters, and the second only applies while authenticated. Fuzzing a
+        form or JSON parameter means sending a POST, and a POST to an
+        authenticated endpoint changes the operator's own data: it places an
+        order, sends a message, updates a profile. Unauthenticated that is mostly
+        harmless and worth testing; signed in it is the scanner acting as the
+        person who authorized it.
+        """
+        # A URL the guard now refuses -- because it changes state and this scan is
+        # authenticated -- must not be fuzzed either.
+        in_scope = [
+            entry for entry in parameters if ctx.guard.decide_url(entry["url"]).allowed
+        ]
+        refused = len(parameters) - len(in_scope)
+        if refused:
+            result.filtered("state_changing_path", refused)
+            result.note(
+                f"{refused} parameter(s) sit on paths that change state, and this scan "
+                "is authenticated, so they were not tested"
+            )
+
+        auth = getattr(ctx.scope, "auth", None)
+        if not ctx.authenticated or auth is None or auth.fuzz_write_methods:
+            return in_scope
+
+        writes = [
+            entry
+            for entry in in_scope
+            if str(entry.get("method") or "GET").upper() != "GET"
+            or ParamLocation(entry.get("location") or ParamLocation.QUERY)
+            is not ParamLocation.QUERY
+        ]
+        if writes:
+            result.filtered("write_method_while_authenticated", len(writes))
+            result.note(
+                f"{len(writes)} form or JSON parameter(s) were not fuzzed: a write to "
+                "an authenticated endpoint changes your own data. Set "
+                "auth.fuzz_write_methods: true to include them"
+            )
+        skipped = {id(entry) for entry in writes}
+        return [entry for entry in in_scope if id(entry) not in skipped]
 
     def _param_target(self, entry: dict) -> ParamTarget:
         """Turn a discovered parameter into a target a verifier can send through.
@@ -899,9 +1003,47 @@ class VulnStage(Stage):
         note = item.rendered_note()
         multi = len(requests) > 1
 
+        # Everything written below is shared with a program, so the session is
+        # stripped on the way in. Redacting at the point of storage rather than at
+        # the point of display means no unredacted copy exists to be leaked by a
+        # report format added later.
+        secrets = self._session_secrets(ctx)
+        needs_session = False
+
         for index, request in enumerate(requests):
             label = f"{item.label} ({request.role})" if multi else item.label
-            headers = dict(request.headers)
+            headers = {
+                name: (redact(value, secrets) or "")
+                for name, value in request.headers.items()
+            }
+            body = redact(request.body, secrets)
+            if secrets and headers != dict(request.headers):
+                needs_session = True
+
+            reproduction = None
+            if request.url:
+                reproduction = redact(
+                    curl_command(
+                        request.method or "GET",
+                        request.url,
+                        headers=dict(request.headers),
+                        body=request.body,
+                        # A cookie-borne payload does not reproduce without its
+                        # cookie, so cookies are kept here even though
+                        # reproductions otherwise strip them. The session inside
+                        # that header is then replaced by the redaction below --
+                        # the payload survives, the credential does not.
+                        include_cookies=True,
+                    ),
+                    secrets,
+                )
+
+            suffix = ""
+            if needs_session and index == 0:
+                suffix = (
+                    f" Replace {SESSION_PLACEHOLDER} with a valid session: this was "
+                    "found while authenticated and does not reproduce without one."
+                )
             await add_evidence(
                 ctx.session,
                 finding_id,
@@ -910,27 +1052,28 @@ class VulnStage(Stage):
                 request_method=request.method or "GET",
                 request_url=request.url or None,
                 request_headers=headers,
-                request_body=request.body,
+                request_body=body,
                 response_status=request.status or item.detail.get("response_status"),
                 # The body excerpt belongs to the request that produced the
                 # signal, not to the control it is compared against.
-                response_excerpt=(item.snippet[:4000] or None) if index == 0 else None,
-                note=(note[:2000] or None) if index == 0 else f"the {request.role} request",
-                curl_command=(
-                    curl_command(
-                        request.method or "GET",
-                        request.url,
-                        headers=headers,
-                        body=request.body,
-                        # A cookie-borne payload does not reproduce without its
-                        # cookie, so it is kept here even though reproductions
-                        # otherwise strip them.
-                        include_cookies=True,
-                    )
-                    if request.url
-                    else None
-                ),
+                response_excerpt=(
+                    (redact(item.snippet, secrets) or "")[:4000] or None
+                )
+                if index == 0
+                else None,
+                note=(
+                    ((redact(note, secrets) or "") + suffix)[:2000] or None
+                )
+                if index == 0
+                else f"the {request.role} request",
+                curl_command=reproduction,
             )
+
+    @staticmethod
+    def _session_secrets(ctx: StageContext) -> tuple[str, ...]:
+        """Credential strings that must never be stored. Empty when unauthenticated."""
+        monitor = getattr(ctx, "session_monitor", None)
+        return monitor.redactions() if monitor is not None else ()
 
     # -- helpers ------------------------------------------------------------
 

@@ -292,10 +292,16 @@ class XssVerifier(ParameterVerifier):
         required: int = 3,
         headless_confirm: bool = True,
         chromium_path: str = "",
+        session_headers: dict[str, str] | None = None,
     ) -> None:
         super().__init__(http, attempts=attempts, required=required)
         self._headless_confirm = headless_confirm
         self._chromium_path = chromium_path
+        # The browser gets a blank profile by default, so an authenticated page
+        # loads as the sign-in form and DOM confirmation fails on every real
+        # finding behind a login -- which downgrades it to Probable for a reason
+        # that has nothing to do with the bug. Seeding the context fixes that.
+        self._session_headers = dict(session_headers or {})
 
     # -- entry point -------------------------------------------------------
 
@@ -555,7 +561,14 @@ class XssVerifier(ParameterVerifier):
                         executable_path=executable, **launch_args
                     )
                 try:
-                    context = await browser.new_context(ignore_https_errors=True)
+                    context = await browser.new_context(
+                        ignore_https_errors=True,
+                        # Without these the browser is a stranger to the
+                        # application: an authenticated page renders as the login
+                        # form, the marker never runs, and a real finding is
+                        # downgraded for the wrong reason.
+                        extra_http_headers=self._session_headers or None,
+                    )
                     page = await context.new_page()
 
                     # The payload calls this. Nothing else defines it, so a call

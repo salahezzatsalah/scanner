@@ -33,6 +33,7 @@ layer none of them have — a verification pipeline:
 | **SQLi: two independent oracles** | Network jitter mistaken for time-based injection |
 | **XSS: context analysis + real DOM execution** | Reflected-but-inert input reported as XSS |
 | **Every class: two independent oracles** | One signal seen twice counted as corroboration |
+| **Session gating** | A scan that silently logged out, reported as a clean result |
 | **WAF state gating** | Whole runs poisoned by block pages read as anomalies |
 | **Cross-asset correlation** | One issue spammed as 200 separate findings |
 | **Evidence or it isn't Confirmed** | Unreproducible findings that waste submissions |
@@ -185,6 +186,48 @@ out of scope, which makes it usable in a script.
 `reconx doctor` reports which external tools are installed, whether the callback
 listener is enabled, and where to get SecLists.
 
+### Scanning behind a login
+
+On a mature program the unauthenticated surface has been swept by hundreds of
+researchers. The bugs are behind the login, so an `auth` block in the scope file is
+usually the difference between a scan that finds something and one that does not.
+
+```yaml
+auth:
+  credential_env: "RECONX_AUTH_ACME"   # the variable, never the value
+  kind: cookie                          # cookie | header | bearer
+  session_check_url: "https://app.acme.com/account"
+  session_check_marker: "Sign out"      # text present only while signed in
+```
+
+```bash
+export RECONX_AUTH_ACME='session=abc123...'    # sign in with a browser, copy it
+reconx scope validate scopes/acme.yaml         # says whether it is set, never what it is
+```
+
+Four things about it are deliberate:
+
+- **The credential is never in the scope file**, which is checked in and is your
+  authorization record. `credential_env` rejects a value that looks like a pasted
+  secret rather than a variable name.
+- **`session_check_marker` is not optional.** A session that expires mid-scan does
+  not fail: every verifier afterwards finds nothing and the run reads as a clean
+  scan. The marker is how that is caught, and findings gathered after it disappears
+  become Needs review rather than clean. A check that cannot complete counts too.
+- **Nothing ReconX stores contains the session.** Evidence rows, `curl`
+  reproductions, the audit log and every report format have it stripped on the way
+  in and replaced with `$YOUR_SESSION`. A cookie-borne *payload* still reproduces:
+  the payload survives, the credential does not. The passive tools never receive it
+  at all, because they query crt.sh and VirusTotal rather than your target.
+- **A logged-in crawler is not a reader.** While authenticated, ~37
+  state-changing path patterns are refused — `/logout`, `/delete`,
+  `/change-password`, `/billing`, `/invite` — and form and JSON parameters are not
+  fuzzed, because a POST to an authenticated endpoint changes your own data. Both
+  are overridable per program; `scope validate` tells you what it turned off.
+
+ReconX does not log in for you. Scripted credential submission is how a scanner
+locks an account out, and it buys nothing.
+
 ### Options that survive into scheduled scans
 
 A flag cannot tune a scan nobody is typing. Anything you want a **monitored**
@@ -255,6 +298,11 @@ These are structural, not advisory:
   hostnames to someone outside the program.
 - **A PTR record is information, not authorization.** Reverse DNS across an address range is
   recorded in full, and a name it returns becomes a testable asset only if the scope covers it.
+- **A session reaches the target and nothing else.** Headers are attached only after the guard has
+  allowed that exact hop, including every redirect, so a credential cannot follow a 302 off-scope.
+  It is redacted on the way into storage rather than on the way out, so no unredacted copy exists.
+- **An authenticated scan says which surface it describes.** The run records the session state, so a
+  scan that lost its session is not mistaken for a scan that found nothing.
 - **Full audit log.** Every request recorded with a timestamp, so you can show exactly what you
   touched and when.
 - **Attributable traffic.** `RECONX_USER_AGENT` is carried by ReconX's own client and by every

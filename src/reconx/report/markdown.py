@@ -153,9 +153,14 @@ async def build_markdown_report(
                 )
                 add(f"- Affects {len(finding.affected_hosts)} host(s): {shown}{extra}")
             if finding.tested_while_throttled:
+                # Set for a host that was blocking or throttling *and* for a scan
+                # whose session expired. Both mean the same thing to a reader --
+                # this was measured in a state where results cannot be trusted --
+                # and the description names which one it was.
                 add(
-                    "- **Note:** the host was rate-limiting during testing, so this "
-                    "result is less reliable than usual"
+                    "- **Note:** this was measured while the target or the scan's "
+                    "session was in a state that makes the result unreliable; the "
+                    "description says which"
                 )
             if finding.recommendation:
                 add("")
