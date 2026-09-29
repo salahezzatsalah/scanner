@@ -33,6 +33,13 @@ def curl_command(
     ``insecure`` defaults to true because scan targets routinely have
     certificate problems, and a reproduction that fails on the certificate
     rather than demonstrating the finding is useless to a triager.
+
+    ``include_cookies`` keeps a ``Cookie`` header that would otherwise be
+    stripped. Reproductions drop it by default so a report never carries a
+    session token by accident, but a finding whose payload *is* a cookie does not
+    reproduce without it -- see ``ParamLocation.COOKIE`` -- so the evidence writer
+    in :mod:`reconx.stages.vulns` sets it. Review a reproduction before pasting it
+    into a report either way.
     """
     parts = ["curl", "-sS", "-i"]
     if insecure:

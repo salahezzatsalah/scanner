@@ -1,0 +1,68 @@
+name: CI
+
+# Runs on push rather than on pull requests because this repository currently
+# has a single branch. Add the pull_request trigger once a default branch exists
+# to merge into.
+on:
+  push:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: python -m pip install --upgrade pip && python -m pip install -e ".[dev]"
+
+      - name: Lint
+        run: python -m ruff check src tests
+
+      # No `ruff format --check` gate: the codebase was not written under it, so
+      # adding one would fail on 63 files this project never touched. `make fmt`
+      # is there for anyone who wants it. `ruff check` is the gate that matters,
+      # and it covers the import order, unused names and loop-variable-capture
+      # mistakes that have actually come up here.
+
+      # The fast gate. The slow end-to-end tests start a local target server and
+      # a headless browser; they run in the job below so a lint or unit failure
+      # reports in under two minutes.
+      - name: Tests (fast)
+        run: python -m pytest -q -m "not slow"
+
+  end-to-end:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: python -m pip install --upgrade pip && python -m pip install -e ".[dev]"
+
+      # XSS execution confirmation needs a real browser. Without one, findings
+      # degrade to Probable rather than being lost, so the suite still passes --
+      # but then it is not testing the thing that makes Confirmed mean something.
+      - name: Install Chromium for Playwright
+        run: python -m playwright install --with-deps chromium
+
+      - name: Tests (all, including end-to-end against the local fixture)
+        run: python -m pytest -q
