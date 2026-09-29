@@ -335,3 +335,102 @@ async def test_identity_resolution_is_cached(guard: ScopeGuard) -> None:
     assert await runner.ensure_available() is True
     assert await runner.ensure_available() is True
     assert calls == 1
+
+
+# ---------------------------------------------------------------------------
+# traffic attribution
+# ---------------------------------------------------------------------------
+#
+# A program that permits automated testing generally also requires the traffic to
+# be attributable, so it can tell research from an attack. Before this existed
+# RECONX_USER_AGENT reached only ReconX's own HTTP client, while the external
+# tools -- which generate most of the volume on a wildcard program -- went out
+# with their own defaults. The audit log said one thing and the target saw
+# another, and unidentified scanner traffic is what gets accounts banned.
+
+
+IDENTITY = "ReconX/0.1 (bug bounty; h1:testhandle)"
+
+# Tools whose traffic reaches the target, so it must carry the operator's identity.
+SPEAKS_TO_TARGET = ("httpx", "katana", "ffuf", "nuclei", "dalfox", "sqlmap")
+
+# Tools that must NOT carry it. The first four ask third-party sources about the
+# target rather than asking the target, so announcing a research identity to them
+# tells the wrong party; naabu and nmap speak TCP and have no headers at all.
+NEVER_IDENTIFIED = ("subfinder", "amass", "gau", "dnsx", "alterx", "naabu", "nmap")
+
+
+@pytest.mark.parametrize("name", SPEAKS_TO_TARGET)
+def test_a_tool_that_reaches_the_target_carries_the_operator_identity(
+    guard: ScopeGuard, name: str
+) -> None:
+    runner = get_runner(name, guard, user_agent=IDENTITY)
+    args = runner.identity_args()
+
+    assert args, f"{name} sends traffic to the target with no identity"
+    assert IDENTITY in args[-1]
+
+
+@pytest.mark.parametrize("name", NEVER_IDENTIFIED)
+def test_a_tool_that_does_not_reach_the_target_is_not_given_an_identity(
+    guard: ScopeGuard, name: str
+) -> None:
+    """The absence matters as much as the presence.
+
+    Passing a researcher handle to subfinder announces it to crt.sh, VirusTotal
+    and every other source it queries -- parties that are not in the program.
+    """
+    runner = get_runner(name, guard, user_agent=IDENTITY)
+    assert runner.identity_args() == []
+
+
+def test_the_header_form_differs_per_tool() -> None:
+    """httpx takes a header line; sqlmap takes the value alone."""
+    assert get_spec("httpx").identity_header_args == ("-H", "{header}: {value}")
+    assert get_spec("sqlmap").identity_header_args == ("--user-agent", "{value}")
+
+
+def test_no_identity_is_sent_when_none_is_configured(guard: ScopeGuard) -> None:
+    assert get_runner("httpx", guard).identity_args() == []
+    assert get_runner("httpx", guard, user_agent="   ").identity_args() == []
+
+
+def test_a_program_specific_header_name_can_be_used(guard: ScopeGuard) -> None:
+    """Some programs ask for a named header of their own rather than a User-Agent."""
+    runner = get_runner(
+        "nuclei", guard, user_agent="testhandle", identity_header="X-Bug-Bounty"
+    )
+    assert runner.identity_args() == ["-H", "X-Bug-Bounty: testhandle"]
+
+
+async def test_the_identity_is_prepended_to_the_actual_command(guard: ScopeGuard) -> None:
+    """Asserted against the executed argv, not against the accessor.
+
+    An accessor that returns the right thing while nothing calls it is exactly the
+    shape of the bug this fixes, so the check is on the command that ran.
+    """
+    spec = ToolSpec(
+        name="identified",
+        binary="echo",
+        purpose="t",
+        install="n/a",
+        version_args=("--version",),
+        identity_pattern=r"coreutils|echo",
+        identity_header_args=("-H", "{header}: {value}"),
+    )
+    runner = ToolRunner(spec, guard, user_agent=IDENTITY)
+    result = await runner.run(["-silent"], targets=["www.example.com"])
+
+    assert result.command[1:3] == ["-H", f"User-Agent: {IDENTITY}"]
+    assert "-silent" in result.command
+    # And it reached the process rather than only the argv list.
+    assert IDENTITY in result.stdout
+
+
+async def test_availability_checks_carry_no_identity(guard: ScopeGuard) -> None:
+    """A --version call does not reach a target, so it names nobody."""
+    statuses = await detect_all(guard)
+    assert statuses, "the catalogue should not be empty"
+    for name, status in statuses.items():
+        if status.available and status.version:
+            assert IDENTITY not in status.version, name

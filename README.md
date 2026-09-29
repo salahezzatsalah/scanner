@@ -257,6 +257,11 @@ These are structural, not advisory:
   recorded in full, and a name it returns becomes a testable asset only if the scope covers it.
 - **Full audit log.** Every request recorded with a timestamp, so you can show exactly what you
   touched and when.
+- **Attributable traffic.** `RECONX_USER_AGENT` is carried by ReconX's own client and by every
+  external tool that speaks HTTP to the target, so a program can tell your research from an attack.
+  Put your handle in it. Set `RECONX_IDENTITY_HEADER` if a program wants its own header name. The
+  passive tools are deliberately excluded: they query crt.sh and VirusTotal, not the target, and
+  your handle is not theirs to have.
 - **Scope-focused by design.** Built to work one program you are authorized on — not for
   untargeted sweeping, and with no detection-evasion features.
 

@@ -39,6 +39,22 @@ not itself checked, and the docstring states why: the authorization check is on
 the **address**, and `4.3.2.1.in-addr.arpa` is the mechanism for asking about it,
 not a host being tested.
 
+### 1b. Traffic that reaches a target is attributable
+
+A program that permits automated testing almost always also requires the traffic
+to be identifiable, so it can tell research from an attack. `RECONX_USER_AGENT`
+(and `RECONX_IDENTITY_HEADER`, for a program that wants its own header name) is
+carried by ReconX's own client **and** by every external tool that speaks HTTP to
+the target — injected once in `ToolRunner.run` from `ToolSpec.identity_header_args`.
+
+Marking a tool in that field is a statement that its traffic reaches the target.
+`subfinder`, `amass`, `gau` and `dnsx` are deliberately *not* marked: they ask
+third-party sources about the target rather than asking the target, so handing them
+a researcher handle announces it to crt.sh and VirusTotal, who are not in the
+program. `naabu` and `nmap` speak TCP and have no headers. A test asserts both the
+presence and the absence, and another asserts the flag reaches the executed argv
+rather than only the accessor.
+
 ### 2. Two independent oracles, or it is not Confirmed
 
 `decide_from_oracles` in `src/reconx/verify/base.py` is the verification standard,

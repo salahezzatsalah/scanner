@@ -32,7 +32,15 @@ class Settings(BaseSettings):
     max_concurrent_hosts: int = Field(default=10, ge=1)
     http_timeout_seconds: float = Field(default=15.0, gt=0)
     dns_timeout_seconds: float = Field(default=5.0, gt=0)
+    # Traffic sent to a target carries this, from ReconX's own client *and* from
+    # every external tool that speaks HTTP. Put your researcher handle in it: a
+    # program that permits automated testing generally also requires the traffic
+    # to be attributable, and unidentified scanner traffic is what gets accounts
+    # banned. e.g. "ReconX/0.1 (bug bounty; h1:yourhandle)".
     user_agent: str = "ReconX/0.1 (authorized security research)"
+    # The header the identity is sent in. Some programs ask for a named header of
+    # their own rather than a User-Agent; set this to that name.
+    identity_header: str = "User-Agent"
     max_retries: int = Field(default=2, ge=0)
 
     # --- verification engine ---------------------------------------------

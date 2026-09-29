@@ -175,6 +175,17 @@ class ToolSpec:
     identity_pattern: str | None = None
     # A human-readable hint shown when a same-named but different tool is found.
     collision_hint: str | None = None
+    # How this tool is told to send an identifying request header, if it speaks
+    # HTTP to the target at all. Two forms are in use across the catalogue:
+    # ("-H", "{header}: {value}") passes one argument pair, and
+    # ("--user-agent", "{value}") passes the value alone.
+    #
+    # Left None on purpose for subfinder, dnsx, gau, amass and naabu. The first
+    # four query third-party sources rather than the target, so announcing a
+    # research identity to them tells the wrong party; naabu speaks TCP and has
+    # no headers to set. Marking a tool here is a statement that its traffic
+    # reaches the target and should be attributable.
+    identity_header_args: tuple[str, str] | None = None
 
 
 @dataclass
@@ -250,6 +261,8 @@ class ToolRunner:
         *,
         default_timeout: float = 600.0,
         env: dict[str, str] | None = None,
+        user_agent: str = "",
+        identity_header: str = "User-Agent",
     ) -> None:
         if not isinstance(guard, ScopeGuard):
             raise TypeError(
@@ -260,6 +273,8 @@ class ToolRunner:
         self._guard = guard
         self._default_timeout = default_timeout
         self._env = env
+        self._user_agent = user_agent.strip()
+        self._identity_header = identity_header.strip() or "User-Agent"
         # Set once a candidate has passed the identity check.
         self._resolved_path: str | None = None
         self._resolution_attempted = False
@@ -405,7 +420,7 @@ class ToolRunner:
         path = self._resolved_path
         assert path is not None  # ensure_available() guarantees this
 
-        argv: list[str] = [path, *args]
+        argv: list[str] = [path, *self.identity_args(), *args]
         skipped: list[str] = []
 
         if targets is not None:
@@ -428,6 +443,27 @@ class ToolRunner:
         result = await self._exec(argv, stdin_data=payload, timeout=timeout)
         result.targets_skipped = skipped
         return result
+
+    def identity_args(self) -> list[str]:
+        """Arguments that make this tool's traffic attributable to the operator.
+
+        A program that permits automated testing almost always also requires the
+        traffic to be identifiable, so it can tell research from an attack. Before
+        this existed, ``RECONX_USER_AGENT`` reached only ReconX's own HTTP client,
+        while subfinder, httpx, katana, nuclei and ffuf -- which generate most of
+        the volume on a wildcard program -- went out with their own defaults. The
+        audit log said one thing and the target saw another.
+
+        Returns an empty list when no user agent is configured, or when the tool
+        does not speak HTTP to the target.
+        """
+        if not self._user_agent or self._spec.identity_header_args is None:
+            return []
+        flag, template = self._spec.identity_header_args
+        return [
+            flag,
+            template.format(header=self._identity_header, value=self._user_agent),
+        ]
 
     async def _exec(
         self, argv: Sequence[str], *, stdin_data: str | None, timeout: float | None

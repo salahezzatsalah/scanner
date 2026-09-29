@@ -29,6 +29,11 @@ _GO = "go install -v"
 # ecosystem being mistaken for the real thing.
 _PD_IDENTITY = r"projectdiscovery|current\s+\S+\s+version|v\d+\.\d+\.\d+"
 
+# How a tool is asked to send an identifying header. Most of the catalogue takes
+# a header line; sqlmap takes the value alone.
+_HEADER_FLAG: tuple[str, str] = ("-H", "{header}: {value}")
+_USER_AGENT_FLAG: tuple[str, str] = ("--user-agent", "{value}")
+
 TOOL_SPECS: dict[str, ToolSpec] = {
     # --- subdomain enumeration ------------------------------------------
     "subfinder": ToolSpec(
@@ -79,6 +84,7 @@ TOOL_SPECS: dict[str, ToolSpec] = {
             "ProjectDiscovery httpx and make sure its directory (usually ~/go/bin) "
             "comes first on PATH, or invoke it by full path."
         ),
+        identity_header_args=_HEADER_FLAG,
     ),
     # --- ports ------------------------------------------------------------
     "naabu": ToolSpec(
@@ -108,6 +114,7 @@ TOOL_SPECS: dict[str, ToolSpec] = {
         install=f"{_GO} github.com/projectdiscovery/katana/cmd/katana@latest",
         fallback="a built-in crawler parses HTML links, forms and script sources",
         identity_pattern=_PD_IDENTITY,
+        identity_header_args=_HEADER_FLAG,
     ),
     "gau": ToolSpec(
         name="gau",
@@ -126,6 +133,7 @@ TOOL_SPECS: dict[str, ToolSpec] = {
         install=f"{_GO} github.com/ffuf/ffuf/v2@latest",
         fallback="a built-in rate-limited path prober with soft-404 filtering",
         identity_pattern=r"ffuf",
+        identity_header_args=_HEADER_FLAG,
     ),
     # --- vulnerability detection ------------------------------------------
     "nuclei": ToolSpec(
@@ -136,6 +144,7 @@ TOOL_SPECS: dict[str, ToolSpec] = {
         fallback="only ReconX's own checks run, which cover far less ground",
         notes="Run 'nuclei -update-templates' after install.",
         identity_pattern=_PD_IDENTITY,
+        identity_header_args=_HEADER_FLAG,
     ),
     "dalfox": ToolSpec(
         name="dalfox",
@@ -145,6 +154,7 @@ TOOL_SPECS: dict[str, ToolSpec] = {
         install=f"{_GO} github.com/hahwul/dalfox/v2@latest",
         fallback="ReconX's own reflection-context analyser is used",
         identity_pattern=r"dalfox",
+        identity_header_args=_HEADER_FLAG,
     ),
     "sqlmap": ToolSpec(
         name="sqlmap",
@@ -158,6 +168,7 @@ TOOL_SPECS: dict[str, ToolSpec] = {
             "modify data or request an OS shell."
         ),
         identity_pattern=r"sqlmap|\d+\.\d+",
+        identity_header_args=_USER_AGENT_FLAG,
     ),
 }
 
@@ -174,6 +185,7 @@ def get_spec(name: str) -> ToolSpec:
 def get_runner(name: str, guard: ScopeGuard, **kwargs) -> ToolRunner:
     """Build a scope-enforcing runner for a catalogued tool."""
     return ToolRunner(get_spec(name), guard, **kwargs)
+
 
 
 async def detect_all(guard: ScopeGuard) -> dict[str, ToolStatus]:

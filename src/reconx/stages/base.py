@@ -101,9 +101,15 @@ class StageContext:
     use_external_tools: bool = True
 
     def tool(self, name: str, **kwargs) -> ToolRunner | _DisabledRunner:
-        """A scope-enforcing runner for a catalogued external tool."""
+        """A scope-enforcing runner for a catalogued external tool.
+
+        The operator's identity is passed to every runner, so traffic a tool sends
+        to the target is attributable to the same person the audit log names.
+        """
         if not self.use_external_tools:
             return _DisabledRunner(get_spec(name))
+        kwargs.setdefault("user_agent", self.settings.user_agent)
+        kwargs.setdefault("identity_header", self.settings.identity_header)
         return get_runner(name, self.guard, **kwargs)
 
     @property
