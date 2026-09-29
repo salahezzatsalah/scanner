@@ -499,9 +499,19 @@ async def test_wordlist_discovery_on_a_soft_404_host_finds_only_real_paths(
         assert missing not in paths, f"{missing} is a soft-404 page, not a discovery"
 
     # And the filtering is accounted for rather than silent.
-    assert result.filter_reasons.get("soft_404", 0) > 20
+    soft_404s = result.filter_reasons.get("soft_404", 0)
+    assert soft_404s > 20
     assert any("soft-404" in note for note in result.notes)
-    assert len(paths) < 25, f"too many endpoints kept, filtering is not working: {len(paths)}"
+
+    # Stated as a ratio rather than a ceiling. The fixture gains routes as
+    # vulnerability classes are added, so a magic number here would fail every
+    # time a real endpoint appears -- which is the opposite of what this test is
+    # for. What must hold is that the host's invented pages were rejected in far
+    # greater number than anything was kept.
+    assert soft_404s > len(paths) * 2, (
+        f"kept {len(paths)} paths against only {soft_404s} filtered: on a host that "
+        "answers every path with 200, filtering is not working"
+    )
 
     await ctx.http.aclose()
     await ctx.sources.aclose()

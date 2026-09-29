@@ -38,7 +38,7 @@ from reconx.stages.base import Stage, StageContext, StageResult
 from reconx.stages.wordlists import (
     COMMON_SUBDOMAIN_LABELS,
     PERMUTATION_AFFIXES,
-    load_wordlist,
+    resolve_wordlist,
 )
 from reconx.tools.base import ToolNotAvailable
 
@@ -288,7 +288,9 @@ class SubdomainStage(Stage):
         candidates: _Candidates,
         result: StageResult,
     ) -> None:
-        words = load_wordlist(self._wordlist_path, COMMON_SUBDOMAIN_LABELS)
+        words, note = resolve_wordlist(self._wordlist_path, COMMON_SUBDOMAIN_LABELS)
+        if note:
+            result.note(f"subdomain wordlist: {note}")
         for root in roots:
             for label in words:
                 candidates.add(f"{label}.{root}", "bruteforce")

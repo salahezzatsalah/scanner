@@ -9,6 +9,12 @@ running and one you babysit.
 Failure is contained: a stage that fails does not abort the run, but stages that
 depend on it are skipped with that reason recorded, because running them on
 missing input produces confident nonsense.
+
+Stages are built from the scope's own ``scan_options`` block unless the caller
+supplies instances. That is what makes a scheduled scan the same scan as a manual
+one: the CLI, the REST API and the monitor all reach the orchestrator, and before
+this the last two had no way to pass anything, so a program under 24/7 monitoring
+ran with built-in wordlists and every default no matter what its operator wanted.
 """
 
 from __future__ import annotations
@@ -35,7 +41,7 @@ from reconx.net.dns import ScopedResolver
 from reconx.net.http import ScopedHttpClient
 from reconx.net.sources import SourceClient
 from reconx.scope.guard import ScopeGuard
-from reconx.scope.model import Scope
+from reconx.scope.model import ScanOptions, Scope
 from reconx.stages.base import Stage, StageContext, StageResult
 from reconx.stages.content import ContentStage
 from reconx.stages.params import ParamStage
@@ -49,6 +55,7 @@ __all__ = [
     "STAGE_REGISTRY",
     "STAGE_GROUPS",
     "Orchestrator",
+    "build_stage",
     "RunSummary",
     "plan_stages",
     "resolve_stage_names",
@@ -79,6 +86,57 @@ STAGE_GROUPS: dict[str, tuple[str, ...]] = {
     "all": tuple(STAGE_REGISTRY),
     "full": tuple(STAGE_REGISTRY),
 }
+
+
+def build_stage(name: str, options: ScanOptions) -> Stage | None:
+    """Construct one stage from a program's persisted scan options.
+
+    Returns None for a stage that takes no options, so the caller can fall back
+    to a plain constructor. Keeping this a function rather than a method means the
+    API, the scheduler and the CLI all produce the same stage from the same block
+    instead of three near-identical constructions that drift.
+    """
+    if name == PassiveReconStage.name:
+        return PassiveReconStage()
+    if name == SubdomainStage.name:
+        return SubdomainStage(
+            wordlist_path=options.subdomain_wordlist,
+            brute_force=options.brute_force_subdomains,
+        )
+    if name == ResolveProbeStage.name:
+        return (
+            ResolveProbeStage(ports=tuple(options.ports))
+            if options.ports
+            else ResolveProbeStage()
+        )
+    if name == ContentStage.name:
+        return ContentStage(
+            wordlist_path=options.path_wordlist,
+            crawl=options.crawl,
+            archives=options.archives,
+            brute_force=options.brute_force_paths,
+        )
+    if name == ParamStage.name:
+        return ParamStage(
+            wordlist_path=options.parameter_wordlist,
+            guess_hidden=options.guess_parameters,
+        )
+    if name == VulnStage.name:
+        skipped = set(options.skip_checks)
+        return VulnStage(
+            run_nuclei=options.run_nuclei,
+            enable_timing=options.enable_timing,
+            headless_xss=options.headless_xss,
+            check_sqli="sqli" not in skipped,
+            check_xss="xss" not in skipped,
+            check_redirect="redirect" not in skipped,
+            check_cors="cors" not in skipped,
+            check_traversal="traversal" not in skipped,
+            check_ssti="ssti" not in skipped,
+            check_cmdi="cmdi" not in skipped,
+            check_ssrf="ssrf" not in skipped,
+        )
+    return None
 
 
 def resolve_stage_names(requested: Sequence[str] | None) -> list[str]:
@@ -226,14 +284,18 @@ class Orchestrator:
         scope_yaml: str = "",
         settings: Settings | None = None,
         stage_instances: dict[str, Stage] | None = None,
-        use_external_tools: bool = True,
+        use_external_tools: bool | None = None,
     ) -> None:
         self._scope = scope
         self._scope_yaml = scope_yaml or f"program: {scope.program}"
         self._settings = settings or get_settings()
         self._guard = ScopeGuard(scope)
         self._overrides = stage_instances or {}
-        self._use_external_tools = use_external_tools
+        options = scope.scan_options
+        # An explicit argument wins, then the scope's own option, then on.
+        self._use_external_tools = (
+            options.use_external_tools if use_external_tools is None else use_external_tools
+        )
         # SQLite has a single-writer limit; see _run_level.
         self._serialize_stages = self._settings.database_url.startswith("sqlite")
 
@@ -242,9 +304,11 @@ class Orchestrator:
         return self._guard
 
     def _stage(self, name: str) -> Stage:
+        """The instance to run: an explicit override, else one built from the scope."""
         if name in self._overrides:
             return self._overrides[name]
-        return STAGE_REGISTRY[name]()
+        built = build_stage(name, self._scope.scan_options)
+        return built if built is not None else STAGE_REGISTRY[name]()
 
     async def run(
         self,

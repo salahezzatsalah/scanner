@@ -39,6 +39,7 @@ _extract = tldextract.TLDExtract(suffix_list_urls=(), include_psl_private_domain
 
 __all__ = [
     "Authorization",
+    "ScanOptions",
     "Scope",
     "ScopeLimits",
     "ScopeRule",
@@ -333,6 +334,68 @@ class ScopeLimits(BaseModel):
     max_requests_per_scan: int | None = Field(default=None, ge=1)
 
 
+class ScanOptions(BaseModel):
+    """How this program is scanned, stored with the scope that authorizes it.
+
+    This block exists because of a real hole: the CLI could tune a scan through
+    flags, and nothing else could. The API and the scheduler each built a default
+    orchestrator, so a program under 24/7 monitoring ran with built-in wordlists
+    and every check on, no matter what the operator wanted -- and the operator had
+    no way to say otherwise. Tuning that lives in a shell command cannot reach a
+    scan nobody is typing.
+
+    Keeping it next to the scope is deliberate: the scope file is the one artefact
+    that travels with a program and is already read by every entry point.
+    """
+
+    # Wordlists. One file cannot serve all three: a subdomain label list, a URL
+    # path list and a parameter name list have nothing in common.
+    subdomain_wordlist: str | None = None
+    path_wordlist: str | None = None
+    parameter_wordlist: str | None = None
+
+    # Breadth.
+    brute_force_subdomains: bool = True
+    brute_force_paths: bool = True
+    guess_parameters: bool = True
+    crawl: bool = True
+    archives: bool = True
+    use_external_tools: bool = True
+
+    # Vulnerability classes. Named rather than booleans-per-class so a new class
+    # does not need a schema change; an unknown name is rejected on load.
+    skip_checks: list[str] = Field(default_factory=list)
+    run_nuclei: bool = True
+    enable_timing: bool = True
+    headless_xss: bool = True
+
+    # Ports to probe, when the port stage runs.
+    ports: list[int] = Field(default_factory=list)
+
+    @field_validator("skip_checks")
+    @classmethod
+    def _known_checks(cls, value: list[str]) -> list[str]:
+        known = {
+            "sqli", "xss", "redirect", "cors", "traversal", "ssti", "cmdi", "ssrf",
+        }
+        cleaned = [item.strip().lower() for item in value if item.strip()]
+        unknown = sorted(set(cleaned) - known)
+        if unknown:
+            raise ValueError(
+                f"unknown check name(s): {', '.join(unknown)}. "
+                f"Valid names: {', '.join(sorted(known))}"
+            )
+        return cleaned
+
+    @field_validator("ports")
+    @classmethod
+    def _valid_ports(cls, value: list[int]) -> list[int]:
+        for port in value:
+            if not 1 <= port <= 65535:
+                raise ValueError(f"{port} is not a valid port number")
+        return sorted(set(value))
+
+
 class Scope(BaseModel):
     """A parsed, validated program scope."""
 
@@ -344,6 +407,7 @@ class Scope(BaseModel):
     in_scope: list[str] = Field(min_length=1)
     out_of_scope: list[str] = Field(default_factory=list)
     limits: ScopeLimits = Field(default_factory=ScopeLimits)
+    scan_options: ScanOptions = Field(default_factory=ScanOptions)
 
     # Populated in the validator below.
     in_scope_rules: list[ScopeRule] = Field(default_factory=list, exclude=True)

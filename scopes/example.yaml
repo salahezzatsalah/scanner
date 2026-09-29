@@ -50,3 +50,40 @@ limits:
   requests_per_second_per_host: 5
   max_concurrent_hosts: 5
   max_concurrent_requests: 20
+
+# ---------------------------------------------------------------------------
+# How this program is scanned. Everything here is optional, and everything here
+# reaches a *scheduled* scan as well as a manual one -- which is the point of
+# the block existing. CLI flags cannot tune a scan nobody is typing, so a
+# program under 24/7 monitoring can only be configured from here.
+#
+# CLI flags still win where you pass them, for a one-off run.
+# ---------------------------------------------------------------------------
+scan_options:
+  # Wordlists. One file cannot serve all three: subdomain labels, URL paths and
+  # parameter names have nothing in common. The built-in lists are fallbacks
+  # (235 labels, 72 paths, 103 names), not wordlists -- `reconx doctor` says
+  # where to get SecLists.
+  # subdomain_wordlist: "~/SecLists/Discovery/DNS/subdomains-top1million-110000.txt"
+  # path_wordlist:      "~/SecLists/Discovery/Web-Content/raft-medium-directories.txt"
+  # parameter_wordlist: "~/SecLists/Discovery/Web-Content/burp-parameter-names.txt"
+
+  # Breadth. Turn brute forcing off for a program that asks you not to, or to
+  # keep a scheduled scan cheap.
+  brute_force_subdomains: true
+  brute_force_paths: true
+  guess_parameters: true
+  crawl: true
+  archives: true              # historical URLs from Wayback and gau
+  use_external_tools: true    # false forces the built-in Python paths
+
+  # Vulnerability classes. Valid names: sqli, xss, redirect, cors, traversal,
+  # ssti, cmdi, ssrf. An unknown name is rejected when the scope is loaded
+  # rather than silently ignored.
+  skip_checks: []
+  run_nuclei: true
+  enable_timing: true         # the time-based SQLi oracle; slow, never confirms alone
+  headless_xss: true          # real browser execution, which is what Confirmed means
+
+  # Ports for the resolve/probe stage. Empty means the built-in set.
+  ports: []

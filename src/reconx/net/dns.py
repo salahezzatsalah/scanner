@@ -15,6 +15,7 @@ from the wildcard's (done by :mod:`reconx.stages.subdomains`).
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import secrets
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
@@ -23,6 +24,7 @@ import dns.asyncresolver
 import dns.exception
 import dns.rdatatype
 import dns.resolver
+import dns.reversename
 
 from reconx.config import Settings, get_settings
 from reconx.net.ratelimit import TokenBucket
@@ -177,6 +179,47 @@ class ScopedResolver:
 
         values = tuple(sorted(rdata.to_text().strip('"').rstrip(".") for rdata in answer))
         return DnsAnswer(host=host, rdtype=rdtype, values=values)
+
+    async def reverse(self, address: str) -> DnsAnswer:
+        """The PTR name for an in-scope address.
+
+        Reverse DNS is the highest-yield recon technique available against an IP
+        range, and it needs an exemption stated rather than smuggled: the query
+        name is ``4.3.2.1.in-addr.arpa``, which is not in any program's scope and
+        which the guard would therefore refuse.
+
+        The authorization check that matters is the one performed here, on the
+        **address**. If the scope covers the address, asking a public resolver
+        what name it carries is in scope; the ``.arpa`` label is the mechanism for
+        asking, not a host being tested. Nothing is sent to the address itself.
+        """
+        try:
+            parsed = ipaddress.ip_address(address)
+        except ValueError:
+            return DnsAnswer(host=str(address), rdtype="PTR", error="not an IP address")
+
+        if not self._guard.decide_host(str(parsed)).allowed:
+            self.blocked += 1
+            return DnsAnswer(
+                host=str(parsed), rdtype="PTR", error="out of scope", out_of_scope=True
+            )
+
+        pointer = dns.reversename.from_address(str(parsed)).to_text().rstrip(".")
+        answer = await self._resolve_unchecked(pointer, "PTR")
+        # Report it against the address, which is what a caller reasons about.
+        return DnsAnswer(
+            host=str(parsed),
+            rdtype="PTR",
+            values=answer.values,
+            error=answer.error,
+        )
+
+    async def reverse_many(self, addresses: Iterable[str]) -> list[DnsAnswer]:
+        """Reverse-resolve many addresses, bounded by the configured limits."""
+        targets = list(addresses)
+        if not targets:
+            return []
+        return list(await asyncio.gather(*(self.reverse(a) for a in targets)))
 
     async def resolve_many(
         self, hosts: Iterable[str], rdtype: str = "A"

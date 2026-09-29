@@ -29,7 +29,7 @@ from sqlmodel import select
 from reconx.db.models import Endpoint
 from reconx.db.store import upsert_endpoint
 from reconx.stages.base import Stage, StageContext, StageResult
-from reconx.stages.wordlists import COMMON_PARAMETER_NAMES, load_wordlist
+from reconx.stages.wordlists import COMMON_PARAMETER_NAMES, resolve_wordlist
 from reconx.verify.base import set_parameter, try_fetch
 from reconx.verify.waf import WafState, classify_response
 
@@ -158,7 +158,9 @@ class ParamStage(Stage):
         # Only guess when the endpoint declares nothing: guessing on top of a
         # known parameter list is mostly wasted requests.
         if self._guess_hidden and not declared:
-            names = load_wordlist(self._wordlist_path, COMMON_PARAMETER_NAMES)
+            names, note = resolve_wordlist(self._wordlist_path, COMMON_PARAMETER_NAMES)
+            if note and note not in result.notes:
+                result.note(f"parameter wordlist: {note}")
             for name in names[: self._max_guessed]:
                 profile = ParamProfile(url=endpoint.url, name=name, declared=False)
                 await self._test_parameter(ctx, profile, baseline)

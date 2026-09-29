@@ -28,7 +28,7 @@ from bs4 import BeautifulSoup
 from reconx.db.models import Severity
 from reconx.db.store import upsert_endpoint, upsert_finding
 from reconx.stages.base import Stage, StageContext, StageResult
-from reconx.stages.wordlists import COMMON_CONTENT_PATHS, load_wordlist
+from reconx.stages.wordlists import COMMON_CONTENT_PATHS, resolve_wordlist
 from reconx.tools.base import ToolNotAvailable
 from reconx.verify.baseline import BaselineCollector
 from reconx.verify.waf import WafState, classify_response
@@ -221,7 +221,7 @@ class ContentStage(Stage):
         if self._archives:
             await self._archived_urls(ctx, host, propose, result)
         if self._brute_force:
-            self._guessed_paths(propose)
+            self._guessed_paths(propose, result)
 
         if len(candidates) > self._max_urls_per_host:
             result.note(
@@ -543,8 +543,16 @@ class ContentStage(Stage):
             if candidate:
                 propose(candidate, "archive:wayback")
 
-    def _guessed_paths(self, propose) -> None:
-        for path in load_wordlist(self._wordlist_path, COMMON_CONTENT_PATHS):
+    def _guessed_paths(self, propose, result: StageResult) -> None:
+        paths, note = resolve_wordlist(self._wordlist_path, COMMON_CONTENT_PATHS)
+        if note:
+            result.note(f"path wordlist: {note}")
+        elif self._wordlist_path is None:
+            result.note(
+                f"using the built-in list of {len(paths)} paths; point "
+                "--path-wordlist at SecLists for real coverage"
+            )
+        for path in paths:
             propose(path if path.startswith("/") else f"/{path}", "wordlist")
 
     # -- confirmation -------------------------------------------------------

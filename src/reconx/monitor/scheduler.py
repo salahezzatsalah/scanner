@@ -85,7 +85,7 @@ class MonitorService:
         settings: Settings | None = None,
         tick_seconds: int = 60,
         notifiers: NotifierHub | None = None,
-        use_external_tools: bool = True,
+        use_external_tools: bool | None = None,
     ) -> None:
         self._settings = settings or get_settings()
         self._tick_seconds = max(10, tick_seconds)
@@ -223,6 +223,10 @@ class MonitorService:
             await self._mark_failure(program_id, stages)
             return
 
+        # Stages are built from the program's own scan_options, so a monitored
+        # program runs the scan its operator configured rather than a default one.
+        # Before scan_options existed there was nowhere to put that choice and no
+        # way to pass it here, which made every scheduled scan untunable.
         orchestrator = Orchestrator(
             scope,
             scope_yaml=scope_yaml,

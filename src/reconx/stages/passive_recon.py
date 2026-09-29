@@ -9,6 +9,15 @@ target's own infrastructure beyond DNS:
 * **DNS records** across A, AAAA, CNAME, MX, NS, TXT, SOA and CAA.
 * **IP attribution** for every resolved address: RDAP network data, plus ASN
   and announced prefix via Team Cymru's TXT records over DNS-over-HTTPS.
+* **Network attribution** for an IP range named directly in the scope: RDAP for
+  the netblock, ASN and announced prefix for its first address, and **reverse DNS
+  across the range**. That last one matters more than the rest put together. A
+  scope of ``203.0.113.0/24`` names no domains, so before this existed the stage
+  printed "scope named no domains to profile" and stopped -- the single
+  highest-yield technique available against a range was unreachable. Names found
+  this way go through :class:`~reconx.scope.guard.ScopeGuard` and become assets,
+  which seeds the resolve, content, parameter and vulnerability stages for a
+  scope that previously produced nothing at all.
 
 Every source is optional. One being down or rate-limiting produces a note in
 the stage result, never a failed run.
@@ -22,7 +31,7 @@ from typing import Any
 from reconx.db.models import AssetKind
 from reconx.db.store import record_observation, upsert_asset
 from reconx.net.dns import RECORD_TYPES
-from reconx.stages.base import Stage, StageContext, StageResult
+from reconx.stages.base import Stage, StageContext, StageResult, registrable_domain
 
 __all__ = ["PassiveReconStage"]
 
@@ -67,23 +76,158 @@ class PassiveReconStage(Stage):
     requires = ()
     active = False
 
+    def __init__(self, *, max_reverse_lookups: int = 1024) -> None:
+        # The same order of magnitude as the resolve stage's CIDR cap: a /22 is
+        # worth sweeping, a /8 is not. PTR queries are cheap but not free, and
+        # they go to a public resolver rather than to the target.
+        self._max_reverse_lookups = max(0, max_reverse_lookups)
+
     async def run(self, ctx: StageContext) -> StageResult:
         result = StageResult(stage=self.name)
         domains = ctx.target_domains
         seed_hosts = list(dict.fromkeys([*domains, *ctx.scope.seed_hosts]))
-        result.items_in = len(seed_hosts)
+        networks = list(dict.fromkeys(ctx.scope.seed_networks))
+        result.items_in = len(seed_hosts) + len(networks)
 
-        if not seed_hosts:
-            result.note("scope named no domains to profile")
+        if not seed_hosts and not networks:
+            result.note("scope named no domains or address ranges to profile")
             return result
 
-        await self._registration_data(ctx, domains, result)
-        addresses = await self._dns_records(ctx, seed_hosts, result)
+        addresses: set[str] = set()
+        if seed_hosts:
+            await self._registration_data(ctx, domains, result)
+            addresses = await self._dns_records(ctx, seed_hosts, result)
+
+        discovered_names: list[str] = []
+        if networks:
+            discovered_names = await self._network_attribution(ctx, networks, result)
+
         await self._ip_attribution(ctx, addresses, result)
 
-        result.items_out = len(seed_hosts)
-        result.checkpoint = {"profiled_domains": domains}
+        result.items_out = len(seed_hosts) + len(discovered_names)
+        result.checkpoint = {
+            "profiled_domains": domains,
+            "profiled_networks": networks,
+        }
         return result
+
+    # -- networks named directly in the scope ------------------------------
+
+    async def _network_attribution(
+        self, ctx: StageContext, networks: list[str], result: StageResult
+    ) -> list[str]:
+        """Profile an IP range: who owns it, who announces it, and what it hosts."""
+        found: list[str] = []
+
+        for entry in networks:
+            try:
+                network = ipaddress.ip_network(entry, strict=False)
+            except ValueError:
+                result.note(f"{entry} is not a usable address or range")
+                continue
+
+            # RDAP and Cymru describe the netblock, so one address is enough.
+            representative = str(network.network_address)
+            await self._rdap_ip(ctx, representative, result)
+            await self._asn(ctx, representative, result)
+            await record_observation(
+                ctx.session,
+                ctx.program_id,
+                kind="netblock",
+                key=f"{entry}:size",
+                value=str(network.num_addresses),
+                source="scope",
+            )
+
+            found.extend(await self._reverse_sweep(ctx, network, entry, result))
+
+        if found:
+            result.note(
+                f"reverse DNS named {len(found)} host(s) inside the scope's address "
+                "range(s), which seeds the rest of the pipeline"
+            )
+        return found
+
+    async def _reverse_sweep(
+        self,
+        ctx: StageContext,
+        network: ipaddress.IPv4Network | ipaddress.IPv6Network,
+        entry: str,
+        result: StageResult,
+    ) -> list[str]:
+        """Ask what name each address in the range carries.
+
+        The names that come back are *claims by a third party* about an address:
+        a PTR record can point anywhere, including at a host nobody authorized
+        testing for. So every one is put through the guard before it becomes an
+        asset, and the ones that fall outside the scope are counted as filtered
+        rather than followed.
+        """
+        if self._max_reverse_lookups == 0:
+            return []
+        if network.num_addresses > self._max_reverse_lookups:
+            result.note(
+                f"{entry} holds {network.num_addresses} addresses, above the "
+                f"{self._max_reverse_lookups} reverse-lookup limit, so it was not "
+                "swept; narrow the scope entry to cover it"
+            )
+            return []
+
+        targets = (
+            [str(network.network_address)]
+            if network.num_addresses == 1
+            else [str(address) for address in network.hosts()]
+        )
+        answers = await ctx.dns.reverse_many(targets)
+
+        named: list[str] = []
+        # Names a PTR pointed at that the scope does not cover. Not tested, but
+        # by far the most useful thing an address range gives up: they name the
+        # organisation and its conventions, which is what to ask a program to add.
+        outside: set[str] = set()
+
+        for answer in answers:
+            for value in answer.values:
+                name = value.rstrip(".")
+                if not name:
+                    continue
+                await record_observation(
+                    ctx.session,
+                    ctx.program_id,
+                    kind="dns_record",
+                    key=f"{answer.host}:PTR",
+                    value=name,
+                    source="reverse-dns",
+                )
+                if not ctx.guard.decide_host(name).allowed:
+                    # A PTR pointing outside the scope is information, not a
+                    # licence: whoever controls reverse DNS for an address can
+                    # point it anywhere, so it is recorded and not tested.
+                    result.filtered("ptr_out_of_scope")
+                    outside.add(name)
+                    continue
+                _, is_new = await upsert_asset(
+                    ctx.session,
+                    ctx.program_id,
+                    name,
+                    kind=AssetKind.DOMAIN,
+                    sources=["passive_recon:reverse-dns"],
+                    resolved_ips=[answer.host],
+                )
+                named.append(name)
+                if is_new:
+                    result.new_assets.append(name)
+
+        if outside:
+            roots = sorted({registrable_domain(name) or name for name in outside})
+            result.note(
+                f"reverse DNS inside {entry} pointed at {len(outside)} name(s) the scope "
+                f"does not cover, under {', '.join(roots[:8])}"
+                + (f" and {len(roots) - 8} more" if len(roots) > 8 else "")
+                + ". They are recorded and were not tested; ask the program whether "
+                "they are in scope"
+            )
+        return named
 
     # -- RDAP -------------------------------------------------------------
 

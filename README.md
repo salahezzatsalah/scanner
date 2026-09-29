@@ -32,6 +32,7 @@ layer none of them have — a verification pipeline:
 | **Control/differential testing** | "That SQL error string was always on the page" |
 | **SQLi: two independent oracles** | Network jitter mistaken for time-based injection |
 | **XSS: context analysis + real DOM execution** | Reflected-but-inert input reported as XSS |
+| **Every class: two independent oracles** | One signal seen twice counted as corroboration |
 | **WAF state gating** | Whole runs poisoned by block pages read as anomalies |
 | **Cross-asset correlation** | One issue spammed as 200 separate findings |
 | **Evidence or it isn't Confirmed** | Unreproducible findings that waste submissions |
@@ -39,6 +40,38 @@ layer none of them have — a verification pipeline:
 Findings land in tiers — **Confirmed**, **Probable**, **Needs review**, **Discarded**. Only the
 first two surface by default. Discarded findings are *kept, with the reason they were dropped*, so
 you can audit the filter rather than trust it blindly.
+
+### The classes, and the trap each one has to reject
+
+Every vulnerability class is paired in the test fixture with a route where the
+same *signal* appears for an innocent reason. A class without a trap does not
+ship, because nothing has shown it can say no until it has rejected something —
+and saying no is the entire value here. Each trap below is a finding other
+scanners report.
+
+| Class | Confirmed on | The trap it rejects |
+|---|---|---|
+| SQL injection | a boolean differential **and** a driver error a benign control does not produce | a page whose template always contains SQL error text |
+| Cross-site scripting | escapable context **and** execution in a real browser | input reflected but encoded, so it is inert |
+| Open redirect | an absolute **and** a protocol-relative value reaching a host we name | a URL printed into the page that nothing redirects to |
+| CORS | an arbitrary origin reflected **and** credentials allowed with it | `Access-Control-Allow-Origin: *` with no credentials, which is the intended config for a public API |
+| Path traversal | two **different** well-known files reached, each against a control | a page documenting `/etc/passwd`, so the record shape is in its text |
+| Template injection | a random product computed **and** a dialect-specific expression naming the engine | template braces reflected but never evaluated |
+| Command injection | shell arithmetic **and** command substitution, both computing a value the request never contained | an endpoint that echoes the command line without running it |
+| SSRF | a callback we observe arriving **and** its answer coming back in the response | a parameter that fetches internally but always the same fixed URL |
+| Subdomain takeover | delegation, the service's unclaimed page, **and** a dangling check | a page containing a service's unclaimed text without delegating to it |
+
+Timing signals never confirm anything on their own, in any class. Network
+variance imitates them too well.
+
+**What the payloads will not do.** Command injection uses read-only markers only:
+shell arithmetic spawns no process, `expr` computes and exits. Nothing writes,
+deletes, opens a shell, reads a file or reaches the network. Path traversal reads
+one matching record to prove the boundary is crossed and does not enumerate or
+exfiltrate. nuclei runs with `dos,fuzz,intrusive,stress` excluded. The SSRF
+callback listener is **local**: it binds loopback, is off by default, and there is
+no setting pointing it at a hosted interaction service — that would publish the
+target's hostnames to a third party outside the program.
 
 ---
 
@@ -116,9 +149,20 @@ reconx scope list
 reconx scan run acme --stage recon        # passive recon + subdomains + probe
 reconx scan run acme                      # everything available
 reconx scan run acme --no-brute           # passive enumeration only
-reconx scan run acme --wordlist big.txt   # deeper brute force
 reconx scan run acme --no-external-tools  # pure Python, ignore installed scanners
 reconx scan run acme --resume 42          # pick up an interrupted run
+
+# Wordlists. One file cannot serve all three -- subdomain labels, URL paths and
+# parameter names have nothing in common -- so each has its own flag. The
+# built-in lists are 235 / 72 / 103 entries: fallbacks, not wordlists.
+#   git clone --depth 1 https://github.com/danielmiessler/SecLists
+reconx scan run acme \
+  --wordlist       SecLists/Discovery/DNS/subdomains-top1million-110000.txt \
+  --path-wordlist  SecLists/Discovery/Web-Content/raft-medium-directories.txt \
+  --param-wordlist SecLists/Discovery/Web-Content/burp-parameter-names.txt
+
+reconx scan run acme --skip-check cmdi --skip-check ssti   # narrow the classes
+reconx scan run acme --oob                # enable the local SSRF callback listener
 
 reconx scan history acme
 reconx assets list acme --live
@@ -137,6 +181,28 @@ reconx api                        # HTTP API on 127.0.0.1:8000, docs at /docs
 `scope validate` and `scope test` send no traffic at all, so you can check a
 scope before you trust it. `scope test` exits non-zero if any target you name is
 out of scope, which makes it usable in a script.
+
+`reconx doctor` reports which external tools are installed, whether the callback
+listener is enabled, and where to get SecLists.
+
+### Options that survive into scheduled scans
+
+A flag cannot tune a scan nobody is typing. Anything you want a **monitored**
+program to use goes in its scope file, under `scan_options` — the CLI, the REST
+API and the scheduler all read it, so a 3am run is the same run you tested by
+hand:
+
+```yaml
+scan_options:
+  path_wordlist: "~/SecLists/Discovery/Web-Content/raft-medium-directories.txt"
+  parameter_wordlist: "~/SecLists/Discovery/Web-Content/burp-parameter-names.txt"
+  skip_checks: ["cmdi"]        # sqli xss redirect cors traversal ssti cmdi ssrf
+  enable_timing: false         # slow, and never confirms alone
+  ports: [80, 443, 8443]
+```
+
+An unknown check name is rejected when the scope loads rather than silently
+ignored, and `scopes/example.yaml` documents every field.
 
 ### 3. Run it continuously
 
@@ -182,7 +248,13 @@ These are structural, not advisory:
   A test asserts no network path bypasses it. Out-of-scope patterns override in-scope wildcards.
 - **Polite by default.** Per-host token-bucket rate limiting and concurrency caps, tuned low.
 - **Intrusive checks are opt-in.** No DoS or stress categories at all. `sqlmap` is constrained to
-  non-destructive detection.
+  non-destructive detection. Command-injection probes are read-only markers; path traversal proves
+  the boundary is crossed and reads no further.
+- **Out-of-band callbacks stay local.** The SSRF listener binds loopback, is off unless you enable
+  it, and cannot be pointed at a hosted interaction service — which would publish the target's
+  hostnames to someone outside the program.
+- **A PTR record is information, not authorization.** Reverse DNS across an address range is
+  recorded in full, and a name it returns becomes a testable asset only if the scope covers it.
 - **Full audit log.** Every request recorded with a timestamp, so you can show exactly what you
   touched and when.
 - **Scope-focused by design.** Built to work one program you are authorized on — not for
@@ -194,17 +266,21 @@ These are structural, not advisory:
 
 ```
 scope.yaml → ScopeGuard → Orchestrator (dependency-ordered, parallel, resumable)
-   ├─ passive_recon ... RDAP registration, DNS records, IP and ASN attribution
+   ├─ passive_recon ... RDAP registration, DNS records, IP and ASN attribution,
+   │                    and reverse DNS across an in-scope address range
    ├─ subdomains ...... passive sources + brute + permutations → wildcard filter
    ├─ resolve_probe ... liveness, tech, TLS → group identical responses
    ├─ ports ........... naabu or a connect scan → exposed-service findings
    ├─ content ......... robots/sitemap, crawl, archives, JS mining → soft-404 filter
    ├─ params .......... parameter discovery + reflection map
-   └─ vulns ........... nuclei, SQLi, XSS, takeover
+   └─ vulns ........... nuclei, SQLi, XSS, takeover, open redirect, CORS,
+                        path traversal, template and command injection, SSRF
                               ↓
                       VERIFICATION ENGINE
               baseline · WAF state · reproducibility
-              differential · two-oracle SQLi · DOM XSS
+              payload-versus-control differential
+              two independent oracles per class · DOM XSS
+              local out-of-band callback listener
                               ↓
    Confirmed / Probable / Needs review / Discarded (with the reason)
                               ↓

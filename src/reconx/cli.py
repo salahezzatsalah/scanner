@@ -27,10 +27,34 @@ from reconx.orchestrator import (
 from reconx.report.markdown import build_markdown_report
 from reconx.scope.guard import ScopeGuard
 from reconx.scope.model import Scope, ScopeParseError, load_scope
+from reconx.stages.wordlists import (
+    COMMON_CONTENT_PATHS,
+    COMMON_PARAMETER_NAMES,
+    COMMON_SUBDOMAIN_LABELS,
+)
 from reconx.tools.registry import detect_all
 
 console = Console()
 err_console = Console(stderr=True)
+
+# Kept as names rather than imported flags so the CLI stays importable without
+# pulling in the whole verification stack at start-up.
+VULN_CHECK_NAMES: tuple[str, ...] = (
+    "sqli", "xss", "redirect", "cors", "traversal", "ssti", "cmdi", "ssrf",
+)
+
+
+def _validate_checks(skip: list[str] | None) -> set[str]:
+    """Reject an unknown class name rather than silently running everything."""
+    requested = {name.strip().lower() for name in (skip or []) if name.strip()}
+    unknown = sorted(requested - set(VULN_CHECK_NAMES))
+    if unknown:
+        err_console.print(
+            f"[red]unknown check(s): {', '.join(unknown)}[/red]\n"
+            f"valid names: {', '.join(sorted(VULN_CHECK_NAMES))}"
+        )
+        raise typer.Exit(code=2)
+    return requested
 
 app = typer.Typer(
     add_completion=False,
@@ -204,6 +228,45 @@ def doctor() -> None:
         console.print(
             f"Verification: a finding must reproduce "
             f"{settings.reproduce_required} of {settings.reproduce_attempts} attempts"
+        )
+        console.print(
+            "Out-of-band callbacks: "
+            + (
+                f"[green]enabled[/green] on {settings.oob_bind_host}:"
+                f"{settings.oob_bind_port or 'an ephemeral port'}"
+                + (
+                    f", advertised as {settings.oob_public_base_url}"
+                    if settings.oob_public_base_url
+                    else " (loopback only, so only a target on this machine can reach it)"
+                )
+                if settings.enable_oob_collaborator
+                else "[yellow]disabled[/yellow], so SSRF is not tested — pass --oob"
+            )
+        )
+
+        # Wordlists decide how much of the application is ever seen, and the
+        # built-in lists are fallbacks rather than wordlists. Saying where to get
+        # a real one belongs in the same place as "which tools are missing".
+        console.print()
+        console.print(
+            Panel(
+                "The built-in lists are small on purpose: "
+                f"{len(COMMON_SUBDOMAIN_LABELS)} subdomain labels, "
+                f"{len(COMMON_CONTENT_PATHS)} paths, "
+                f"{len(COMMON_PARAMETER_NAMES)} parameter names. They exist so a scan "
+                "works with no setup, not so it finds everything.\n\n"
+                "Get SecLists:\n"
+                "  [bold]git clone --depth 1 https://github.com/danielmiessler/SecLists"
+                "[/bold]\n\n"
+                "Then point each list at it — one file cannot serve all three:\n"
+                "  --wordlist        SecLists/Discovery/DNS/subdomains-top1million-110000.txt\n"
+                "  --path-wordlist   SecLists/Discovery/Web-Content/raft-medium-directories.txt\n"
+                "  --param-wordlist  SecLists/Discovery/Web-Content/burp-parameter-names.txt\n\n"
+                "Or put them in the program's scope file under [bold]scan_options[/bold], "
+                "which is the only way a scheduled scan can use them.",
+                title="Wordlists",
+                border_style="cyan",
+            )
         )
         return len(missing)
 
@@ -383,7 +446,31 @@ def scan_run(
         bool, typer.Option("--no-brute", help="Skip active DNS brute forcing")
     ] = False,
     wordlist: Annotated[
-        str | None, typer.Option("--wordlist", help="Path to a subdomain wordlist")
+        str | None,
+        typer.Option(
+            "--wordlist",
+            help=(
+                "Subdomain label wordlist. One file cannot serve all three lists, so "
+                "content and parameter discovery have their own flags"
+            ),
+        ),
+    ] = None,
+    path_wordlist: Annotated[
+        str | None,
+        typer.Option(
+            "--path-wordlist",
+            help=(
+                "URL path wordlist for content discovery. Point this at SecLists; the "
+                "built-in list is 72 entries and is a fallback, not a wordlist"
+            ),
+        ),
+    ] = None,
+    param_wordlist: Annotated[
+        str | None,
+        typer.Option(
+            "--param-wordlist",
+            help="Parameter name wordlist for hidden-parameter discovery",
+        ),
     ] = None,
     max_wildcard_checks: Annotated[
         int,
@@ -426,8 +513,30 @@ def scan_run(
             ),
         ),
     ] = False,
+    skip_check: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--skip-check",
+            help=(
+                "Vulnerability class to skip; repeatable. One of: "
+                f"{', '.join(sorted(VULN_CHECK_NAMES))}"
+            ),
+        ),
+    ] = None,
+    oob: Annotated[
+        bool,
+        typer.Option(
+            "--oob",
+            help=(
+                "Enable the out-of-band callback listener, which SSRF needs. It binds "
+                "loopback and contacts no third-party service; set "
+                "RECONX_OOB_PUBLIC_BASE_URL to an address a remote target can reach"
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Run the pipeline against a program."""
+    skipped = _validate_checks(skip_check)
 
     async def run() -> None:
         scope, raw, slug = await _resolve_program(program)
@@ -438,23 +547,45 @@ def scan_run(
         from reconx.stages.subdomains import SubdomainStage
         from reconx.stages.vulns import VulnStage
 
+        # The scope's own scan_options are the baseline, so a flag omitted here
+        # keeps whatever the program's scope file says rather than silently
+        # reverting to a default. Flags win where they are given.
+        stored = scope.scan_options
         overrides = {
             "subdomains": SubdomainStage(
-                wordlist_path=wordlist,
-                brute_force=not no_brute,
+                wordlist_path=wordlist or stored.subdomain_wordlist,
+                brute_force=stored.brute_force_subdomains and not no_brute,
                 max_wildcard_http_checks=max_wildcard_checks,
             ),
             "content": ContentStage(
-                brute_force=not no_brute,
-                archives=not no_archives,
+                wordlist_path=path_wordlist or stored.path_wordlist,
+                crawl=stored.crawl,
+                brute_force=stored.brute_force_paths and not no_brute,
+                archives=stored.archives and not no_archives,
             ),
-            "params": ParamStage(guess_hidden=not no_brute),
+            "params": ParamStage(
+                wordlist_path=param_wordlist or stored.parameter_wordlist,
+                guess_hidden=stored.guess_parameters and not no_brute,
+            ),
             "vulns": VulnStage(
-                run_nuclei=not no_nuclei,
-                enable_timing=not no_timing,
-                headless_xss=not no_headless,
+                run_nuclei=stored.run_nuclei and not no_nuclei,
+                enable_timing=stored.enable_timing and not no_timing,
+                headless_xss=stored.headless_xss and not no_headless,
+                **{
+                    f"check_{name}": name not in (skipped | set(stored.skip_checks))
+                    for name in VULN_CHECK_NAMES
+                },
             ),
         }
+
+        if oob:
+            # Enabling the listener is a per-scan decision, so it is applied to
+            # this run's settings rather than written anywhere.
+            get_settings().enable_oob_collaborator = True
+        elif "ssrf" not in skipped and not get_settings().enable_oob_collaborator:
+            console.print(
+                "[dim]SSRF needs the out-of-band listener; pass --oob to enable it.[/dim]"
+            )
 
         console.print(
             Panel(

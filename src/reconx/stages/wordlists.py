@@ -16,6 +16,7 @@ __all__ = [
     "COMMON_CONTENT_PATHS",
     "COMMON_PARAMETER_NAMES",
     "load_wordlist",
+    "resolve_wordlist",
 ]
 
 # Labels that pay off across most estates, ordered roughly by hit rate.
@@ -107,20 +108,38 @@ COMMON_PARAMETER_NAMES: tuple[str, ...] = (
 )
 
 
-def load_wordlist(path: str | Path | None, fallback: tuple[str, ...]) -> list[str]:
-    """Read a wordlist file, or return the built-in fallback.
+def resolve_wordlist(
+    path: str | Path | None, fallback: tuple[str, ...]
+) -> tuple[list[str], str | None]:
+    """Read a wordlist file, and say when the built-in fallback was used instead.
 
-    Blank lines and ``#`` comments are ignored. A missing or unreadable file
-    falls back rather than failing, so a bad path never aborts a scan.
+    Blank lines and ``#`` comments are ignored. A missing or unreadable file falls
+    back rather than failing, so a bad path never aborts a scan -- but it must not
+    do so silently either. A typo in a path to SecLists otherwise looks exactly
+    like a successful scan with 10,000 fewer requests, and the operator has no way
+    to tell. The note is returned so the stage can surface it in its result.
     """
     if path is None:
-        return list(fallback)
+        return list(fallback), None
+
     file_path = Path(path).expanduser()
     if not file_path.is_file():
-        return list(fallback)
+        return list(fallback), (
+            f"the wordlist {file_path} does not exist, so the built-in list of "
+            f"{len(fallback)} entries was used instead. Check the path"
+        )
+
     words: list[str] = []
     seen: set[str] = set()
-    for raw_line in file_path.read_text(encoding="utf-8", errors="replace").splitlines():
+    try:
+        contents = file_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return list(fallback), (
+            f"the wordlist {file_path} could not be read ({type(exc).__name__}), so "
+            f"the built-in list of {len(fallback)} entries was used instead"
+        )
+
+    for raw_line in contents.splitlines():
         word = raw_line.strip()
         if not word or word.startswith("#"):
             continue
@@ -128,4 +147,15 @@ def load_wordlist(path: str | Path | None, fallback: tuple[str, ...]) -> list[st
         if lowered not in seen:
             seen.add(lowered)
             words.append(lowered)
-    return words or list(fallback)
+
+    if not words:
+        return list(fallback), (
+            f"the wordlist {file_path} contained no usable entries, so the built-in "
+            f"list of {len(fallback)} was used instead"
+        )
+    return words, f"loaded {len(words)} entries from {file_path}"
+
+
+def load_wordlist(path: str | Path | None, fallback: tuple[str, ...]) -> list[str]:
+    """The words alone, for callers with nowhere to put a note."""
+    return resolve_wordlist(path, fallback)[0]
