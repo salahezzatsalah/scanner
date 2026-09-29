@@ -13,6 +13,14 @@ before any of it becomes a reported finding:
   real browser execution.
 * **Subdomain takeover**, requiring delegation, an unclaimed service page, and a
   dangling check.
+* **Open redirect, CORS misconfiguration, path traversal, template injection and
+  command injection**, each requiring two independent oracles and each paired
+  with a deliberate trap in the test fixture. A class without a trap does not
+  ship, because nothing has shown it can say no.
+* **SSRF**, when the out-of-band collaborator is enabled. It is off by default
+  because it opens a listening port, and it is local-only by design: using a
+  hosted interaction service would publish the target's hostnames to a third
+  party outside the program.
 
 Findings are correlated on the vulnerability class and the normalised path and
 parameter rather than on the full URL, so one issue across fifty hosts of the
@@ -23,6 +31,8 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
+from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 from sqlmodel import select
@@ -33,11 +43,25 @@ from reconx.report.repro import curl_command
 from reconx.stages.base import Stage, StageContext, StageResult
 from reconx.tools.base import ToolNotAvailable
 from reconx.triage.priority import compute_priority
-from reconx.verify.base import Evidence, EvidenceRequest, PreparedRequest, try_fetch
+from reconx.verify.base import (
+    Evidence,
+    EvidenceRequest,
+    ParamLocation,
+    ParamTarget,
+    PreparedRequest,
+    try_fetch,
+)
 from reconx.verify.baseline import BaselineCollector
+from reconx.verify.cmdi import CmdiVerifier
+from reconx.verify.collaborator import LocalCollaborator
+from reconx.verify.cors import CorsVerifier
+from reconx.verify.redirect import RedirectVerifier
 from reconx.verify.reproduce import reproduce
 from reconx.verify.sqli import SqliVerifier
+from reconx.verify.ssrf import SsrfVerifier
+from reconx.verify.ssti import SstiVerifier
 from reconx.verify.takeover import TakeoverVerifier
+from reconx.verify.traversal import TraversalVerifier
 from reconx.verify.xss import XssVerifier
 
 __all__ = ["VulnStage"]
@@ -63,6 +87,232 @@ _UUID_SEGMENT = re.compile(
 )
 
 
+# Parameter names that suggest what a parameter is for. A hint, never a
+# requirement: the value's shape is checked too, and the cheap classes test
+# everything. Their purpose is to spend the expensive checks where they pay.
+_REDIRECT_NAMES = frozenset({
+    "next", "url", "target", "redirect", "redirect_to", "redirect_uri", "redirecturl",
+    "return", "return_to", "returnurl", "return_url", "continue", "dest",
+    "destination", "go", "goto", "out", "view", "to", "image_url", "callback",
+    "checkout_url", "login_url", "logout_url", "forward", "location",
+})
+_FILE_NAMES = frozenset({
+    "file", "filename", "filepath", "path", "page", "doc", "document", "folder",
+    "download", "template", "include", "require", "read", "load", "resource",
+    "attachment", "name", "style", "log", "conf", "config", "report",
+})
+_COMMAND_NAMES = frozenset({
+    "host", "hostname", "ip", "domain", "cmd", "command", "exec", "ping", "query",
+    "dns", "lookup", "target", "address", "url", "code", "run", "shell", "arg",
+    "args", "option", "flag", "interface", "device",
+})
+_URL_NAMES = frozenset({
+    "url", "uri", "src", "source", "dest", "destination", "feed", "callback",
+    "webhook", "proxy", "fetch", "load", "link", "remote", "image", "imageurl",
+    "img", "avatar", "endpoint", "upstream", "host", "site", "page", "target",
+    "domain", "data", "path", "reference", "open", "continue", "redirect",
+})
+
+_URLISH = re.compile(r"^(?:https?://|//|/|\.\.?/)", re.IGNORECASE)
+_FILEISH = re.compile(r"[\w-]+\.[a-z0-9]{1,5}$|^/|\.\./", re.IGNORECASE)
+
+
+def _name_of(entry: dict) -> str:
+    return str(entry.get("name") or "").lower()
+
+
+def _value_of(entry: dict) -> str:
+    from urllib.parse import parse_qsl as _pairs
+
+    name = entry.get("name")
+    for key, value in _pairs(urlsplit(entry.get("url") or "").query, keep_blank_values=True):
+        if key == name:
+            return value
+    return ""
+
+
+@dataclass(frozen=True)
+class ParameterCheck:
+    """One vulnerability class, and how the stage feeds and files it."""
+
+    name: str
+    vuln_class: str
+    title_prefix: str
+    detector: str
+    severity: Severity
+    recommendation: str
+    build: Callable[[VulnStage, StageContext, LocalCollaborator | None], object]
+    selects: Callable[[dict], bool]
+    max_targets: int = 150
+    needs_collaborator: bool = False
+
+
+def _build_sqli(stage: VulnStage, ctx: StageContext, _collab) -> SqliVerifier:
+    return SqliVerifier(
+        ctx.http,
+        attempts=ctx.settings.reproduce_attempts,
+        required=ctx.settings.reproduce_required,
+        enable_timing=stage._enable_timing,
+    )
+
+
+def _build_xss(stage: VulnStage, ctx: StageContext, _collab) -> XssVerifier:
+    return XssVerifier(
+        ctx.http,
+        attempts=ctx.settings.reproduce_attempts,
+        required=ctx.settings.reproduce_required,
+        headless_confirm=stage._headless_xss and ctx.settings.headless_xss_confirm,
+        chromium_path=ctx.settings.chromium_path,
+    )
+
+
+def _plain(cls):
+    def build(_stage: VulnStage, ctx: StageContext, _collab):
+        return cls(
+            ctx.http,
+            attempts=ctx.settings.reproduce_attempts,
+            required=ctx.settings.reproduce_required,
+        )
+
+    return build
+
+
+def _build_cmdi(stage: VulnStage, ctx: StageContext, _collab) -> CmdiVerifier:
+    return CmdiVerifier(
+        ctx.http,
+        attempts=ctx.settings.reproduce_attempts,
+        required=ctx.settings.reproduce_required,
+        enable_timing=stage._enable_timing,
+    )
+
+
+def _build_ssrf(_stage: VulnStage, ctx: StageContext, collab) -> SsrfVerifier:
+    return SsrfVerifier(
+        ctx.http,
+        collab,
+        attempts=ctx.settings.reproduce_attempts,
+        required=max(1, ctx.settings.reproduce_required - 1),
+        callback_timeout=ctx.settings.oob_callback_timeout_seconds,
+        # So a callback the scanner itself made is recognised as ours.
+        own_user_agent=ctx.settings.user_agent,
+    )
+
+
+PARAMETER_CHECKS: tuple[ParameterCheck, ...] = (
+    ParameterCheck(
+        name="sqli",
+        vuln_class="sqli",
+        title_prefix="SQL injection",
+        detector="reconx:sqli",
+        severity=Severity.CRITICAL,
+        recommendation=(
+            "Confirm by hand with the recorded requests, then report with the boolean "
+            "pair as proof. The fix is parameterised queries, not input filtering."
+        ),
+        build=_build_sqli,
+        selects=lambda e: bool(e.get("changes_response") or e.get("reflected")),
+    ),
+    ParameterCheck(
+        name="xss",
+        vuln_class="xss",
+        title_prefix="Reflected cross-site scripting",
+        detector="reconx:xss",
+        severity=Severity.HIGH,
+        recommendation=(
+            "The recorded payload URL reproduces it. Report with the context that made "
+            "it exploitable; the fix is context-correct output encoding."
+        ),
+        build=_build_xss,
+        selects=lambda e: bool(e.get("reflected")),
+    ),
+    ParameterCheck(
+        name="redirect",
+        vuln_class="open_redirect",
+        title_prefix="Open redirect",
+        detector="reconx:redirect",
+        severity=Severity.LOW,
+        recommendation=(
+            "On its own this is usually informational. Chain it with something that "
+            "trusts the destination -- an OAuth redirect_uri, a reset link, a token in "
+            "the fragment -- and report what leaks across the hop."
+        ),
+        build=_plain(RedirectVerifier),
+        selects=lambda e: (
+            _name_of(e) in _REDIRECT_NAMES or bool(_URLISH.match(_value_of(e)))
+        ),
+    ),
+    ParameterCheck(
+        name="traversal",
+        vuln_class="path_traversal",
+        title_prefix="Path traversal",
+        detector="reconx:traversal",
+        severity=Severity.HIGH,
+        recommendation=(
+            "The boundary crossing is the finding. Report the parameter, the depth "
+            "needed and the one record matched, and do not read further."
+        ),
+        build=_plain(TraversalVerifier),
+        selects=lambda e: (
+            _name_of(e) in _FILE_NAMES or bool(_FILEISH.search(_value_of(e)))
+        ),
+        max_targets=40,
+    ),
+    ParameterCheck(
+        name="ssti",
+        vuln_class="template_injection",
+        title_prefix="Server-side template injection",
+        detector="reconx:ssti",
+        severity=Severity.CRITICAL,
+        recommendation=(
+            "Report the evaluation with the engine named and the computed value as "
+            "proof. Whether to pursue code execution is the program's call, not a "
+            "default."
+        ),
+        build=_plain(SstiVerifier),
+        # Evaluation has to be visible, so a reflected parameter is the only kind
+        # worth the requests.
+        selects=lambda e: bool(e.get("reflected")),
+        max_targets=60,
+    ),
+    ParameterCheck(
+        name="cmdi",
+        vuln_class="command_injection",
+        title_prefix="Command injection",
+        detector="reconx:cmdi",
+        severity=Severity.CRITICAL,
+        recommendation=(
+            "The computed value is complete proof that the command string is yours. "
+            "Report it as is; running anything beyond arithmetic on someone else's "
+            "host is the escalation that gets reports closed."
+        ),
+        build=_build_cmdi,
+        selects=lambda e: (
+            _name_of(e) in _COMMAND_NAMES
+            or bool(e.get("reflected"))
+            or bool(e.get("changes_response"))
+        ),
+        max_targets=30,
+    ),
+    ParameterCheck(
+        name="ssrf",
+        vuln_class="ssrf",
+        title_prefix="Server-side request forgery",
+        detector="reconx:ssrf",
+        severity=Severity.HIGH,
+        recommendation=(
+            "Severity is decided by reach: cloud metadata, an internal service, or "
+            "only outward. Report with the callback log and say which you established."
+        ),
+        build=_build_ssrf,
+        selects=lambda e: (
+            _name_of(e) in _URL_NAMES or bool(_URLISH.match(_value_of(e)))
+        ),
+        max_targets=40,
+        needs_collaborator=True,
+    ),
+)
+
+
 def normalize_path_template(url: str) -> str:
     """Reduce a URL path to a shape, for correlating findings across hosts."""
     path = urlsplit(url).path or "/"
@@ -84,19 +334,38 @@ class VulnStage(Stage):
         check_sqli: bool = True,
         check_xss: bool = True,
         check_takeover: bool = True,
+        check_redirect: bool = True,
+        check_cors: bool = True,
+        check_traversal: bool = True,
+        check_ssti: bool = True,
+        check_cmdi: bool = True,
+        check_ssrf: bool = True,
         enable_timing: bool = True,
         headless_xss: bool = True,
         max_parameters: int = 150,
         max_takeover_hosts: int = 200,
+        max_cors_urls: int = 60,
     ) -> None:
         self._run_nuclei = run_nuclei
-        self._check_sqli = check_sqli
-        self._check_xss = check_xss
         self._check_takeover = check_takeover
         self._enable_timing = enable_timing
         self._headless_xss = headless_xss
         self._max_parameters = max_parameters
         self._max_takeover_hosts = max_takeover_hosts
+        self._max_cors_urls = max_cors_urls
+        # SSRF defaults on here but still needs the collaborator, which is off by
+        # default: enabling it opens a listening port, which is the operator's
+        # decision rather than a scanner's.
+        self._enabled = {
+            "sqli": check_sqli,
+            "xss": check_xss,
+            "redirect": check_redirect,
+            "cors": check_cors,
+            "traversal": check_traversal,
+            "ssti": check_ssti,
+            "cmdi": check_cmdi,
+            "ssrf": check_ssrf,
+        }
 
     # -- entry point -------------------------------------------------------
 
@@ -114,7 +383,7 @@ class VulnStage(Stage):
             await self._takeovers(ctx, result)
         if self._run_nuclei:
             await self._nuclei(ctx, result)
-        if self._check_sqli or self._check_xss:
+        if any(self._enabled.values()):
             await self._parameter_checks(ctx, result)
 
         result.items_out = self._surfaced
@@ -347,66 +616,146 @@ class VulnStage(Stage):
     # -- parameter checks ---------------------------------------------------
 
     async def _parameter_checks(self, ctx: StageContext, result: StageResult) -> None:
+        """Run every enabled parameter check, one table row per vulnerability class.
+
+        This used to be a copy-pasted block per class. It is a table now because
+        the interesting part of adding a class is its oracles, not the plumbing
+        that feeds it parameters and saves what it decided.
+        """
+        # CORS does not need parameters, so it runs before the early return.
+        await self._cors_checks(ctx, result)
+
         parameters = ctx.shared.get("parameters") or await self._parameters_from_db(ctx)
         if not parameters:
             result.note("no parameters to test; run the params stage first")
             return
 
-        sqli_targets = [
-            entry
-            for entry in parameters
-            if entry.get("changes_response") or entry.get("reflected")
-        ][: self._max_parameters]
-        xss_targets = [entry for entry in parameters if entry.get("reflected")][
-            : self._max_parameters
-        ]
+        collaborator: LocalCollaborator | None = None
+        try:
+            for check in PARAMETER_CHECKS:
+                if not self._enabled.get(check.name, False):
+                    continue
 
-        result.items_in += len(sqli_targets) + len(xss_targets)
+                targets = [entry for entry in parameters if check.selects(entry)]
+                if not targets:
+                    continue
+                targets = targets[: min(check.max_targets, self._max_parameters)]
 
-        if self._check_sqli and sqli_targets:
-            verifier = SqliVerifier(
-                ctx.http,
-                attempts=ctx.settings.reproduce_attempts,
-                required=ctx.settings.reproduce_required,
-                enable_timing=self._enable_timing,
+                if check.needs_collaborator:
+                    collaborator = collaborator or await self._start_collaborator(
+                        ctx, result
+                    )
+                    if collaborator is None:
+                        result.used_fallback(
+                            "the out-of-band collaborator is disabled, so SSRF was not "
+                            "tested. Enable RECONX_ENABLE_OOB_COLLABORATOR to test it"
+                        )
+                        continue
+
+                verifier = check.build(self, ctx, collaborator)
+                result.items_in += len(targets)
+
+                for entry in targets:
+                    verdict = await verifier.verify(self._param_target(entry))
+                    if verdict.tier is FindingTier.DISCARDED:
+                        result.filtered(f"{check.vuln_class}_not_confirmed")
+                    await self._save_parameter_verdict(
+                        ctx, result, verdict,
+                        vuln_class=check.vuln_class,
+                        title_prefix=check.title_prefix,
+                        detector=check.detector,
+                        severity=check.severity,
+                        recommendation=check.recommendation,
+                    )
+        finally:
+            if collaborator is not None:
+                await collaborator.stop()
+
+    def _param_target(self, entry: dict) -> ParamTarget:
+        """Turn a discovered parameter into a target a verifier can send through.
+
+        Form parameters carry their siblings and are sent as a POST body, which is
+        how they are actually reached. Before ``ParamTarget`` existed they were
+        rewritten into the query string, so a form-only parameter was tested at a
+        place the application does not read.
+        """
+        location = ParamLocation(entry.get("location") or ParamLocation.QUERY)
+        return ParamTarget(
+            url=entry["url"],
+            name=entry["name"],
+            location=location,
+            method=str(entry.get("method") or ""),
+            siblings=dict(entry.get("siblings") or {}),
+        )
+
+    async def _start_collaborator(
+        self, ctx: StageContext, result: StageResult
+    ) -> LocalCollaborator | None:
+        """Start the loopback callback listener, if the operator enabled it."""
+        settings = ctx.settings
+        if not settings.enable_oob_collaborator:
+            return None
+        collaborator = LocalCollaborator(
+            bind_host=settings.oob_bind_host,
+            bind_port=settings.oob_bind_port,
+            public_base_url=settings.oob_public_base_url,
+        )
+        await collaborator.start()
+        if collaborator.is_loopback_only:
+            result.note(
+                "the callback listener is bound to loopback, so only a target on this "
+                "machine can reach it. Set RECONX_OOB_PUBLIC_BASE_URL to an address the "
+                "target can reach before treating a quiet listener as a clean result"
             )
-            for entry in sqli_targets:
-                verdict = await verifier.verify(entry["url"], entry["name"])
-                if verdict.tier is FindingTier.DISCARDED:
-                    result.filtered("sqli_not_confirmed")
-                await self._save_parameter_verdict(
-                    ctx, result, verdict, vuln_class="sqli",
-                    title_prefix="SQL injection", detector="reconx:sqli",
-                    severity=Severity.CRITICAL,
-                    recommendation=(
-                        "Confirm by hand with the recorded requests, then report with "
-                        "the boolean pair as proof. The fix is parameterised queries, "
-                        "not input filtering."
-                    ),
-                )
+        return collaborator
 
-        if self._check_xss and xss_targets:
-            verifier = XssVerifier(
-                ctx.http,
-                attempts=ctx.settings.reproduce_attempts,
-                required=ctx.settings.reproduce_required,
-                headless_confirm=self._headless_xss and ctx.settings.headless_xss_confirm,
-                chromium_path=ctx.settings.chromium_path,
+    async def _cors_checks(self, ctx: StageContext, result: StageResult) -> None:
+        """CORS is a property of a response, so it is checked per URL.
+
+        Fed from every discovered endpoint rather than from the parameter list.
+        Drawing it from parameters looked reasonable and silently skipped every
+        endpoint that takes none -- which is most API endpoints, and precisely the
+        ones whose responses are worth reading cross-origin.
+        """
+        if not self._enabled.get("cors", False):
+            return
+
+        rows = await ctx.session.execute(
+            select(Endpoint)
+            .where(Endpoint.program_id == ctx.program_id)
+            .order_by(Endpoint.interesting_score.desc())
+        )
+        seen: list[str] = []
+        for endpoint in rows.scalars().all():
+            url = endpoint.url.split("?")[0]
+            if url not in seen and ctx.guard.decide_url(url).allowed:
+                seen.append(url)
+        urls = seen[: self._max_cors_urls]
+        if not urls:
+            return
+
+        verifier = CorsVerifier(
+            ctx.http,
+            attempts=ctx.settings.reproduce_attempts,
+            required=ctx.settings.reproduce_required,
+        )
+        result.items_in += len(urls)
+        for url in urls:
+            verdict = await verifier.verify(url)
+            if verdict.tier is FindingTier.DISCARDED:
+                result.filtered("cors_misconfiguration_not_confirmed")
+            await self._save_parameter_verdict(
+                ctx, result, verdict,
+                vuln_class="cors_misconfiguration",
+                title_prefix="CORS allows credentialed cross-origin reads",
+                detector="reconx:cors",
+                severity=Severity.MEDIUM,
+                recommendation=(
+                    "Name one endpoint whose response is worth reading and prove it is "
+                    "readable cross-origin as an authenticated user. The fix is an exact "
+                    "allowlist comparison, not a substring match."
+                ),
             )
-            for entry in xss_targets:
-                verdict = await verifier.verify(entry["url"], entry["name"])
-                if verdict.tier is FindingTier.DISCARDED:
-                    result.filtered("xss_not_confirmed")
-                await self._save_parameter_verdict(
-                    ctx, result, verdict, vuln_class="xss",
-                    title_prefix="Reflected cross-site scripting",
-                    detector="reconx:xss", severity=Severity.HIGH,
-                    recommendation=(
-                        "The recorded payload URL reproduces it. Report with the "
-                        "context that made it exploitable; the fix is context-correct "
-                        "output encoding."
-                    ),
-                )
 
     async def _parameters_from_db(self, ctx: StageContext) -> list[dict]:
         rows = await ctx.session.execute(
@@ -444,12 +793,20 @@ class VulnStage(Stage):
         # to guess them from the verifier's class.
         signals = list(verdict.signals or verdict.agreeing)
 
+        # A class that is a property of the response rather than of a parameter
+        # (CORS) has no parameter to name, and " in '' at /x" reads like a bug.
+        title = (
+            f"{title_prefix} in '{verdict.parameter}' at {template}"
+            if verdict.parameter
+            else f"{title_prefix} at {template}"
+        )
+
         await self._save(
             ctx,
             result,
             dedup_key=f"{vuln_class}::{template}::{verdict.parameter}",
             vuln_class=vuln_class,
-            title=f"{title_prefix} in '{verdict.parameter}' at {template}",
+            title=title,
             severity=severity if verdict.vulnerable else Severity.INFO,
             tier=verdict.tier,
             confidence=verdict.confidence,

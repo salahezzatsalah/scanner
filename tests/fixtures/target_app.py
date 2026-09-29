@@ -3,18 +3,38 @@
 You cannot validate a scanner without a target whose truth you already know.
 This serves, on 127.0.0.1 only:
 
+Every vulnerability class ReconX verifies is paired here: a route where the bug
+is real, and a route where the same *signal* appears for an innocent reason. A
+class without a trap is not trustworthy, because nothing has shown it can say no.
+
 **Real behaviour to detect**
-  ``/``, ``/admin``, ``/api/users``   distinct pages a probe should find
-  ``/xss``                            reflects input unencoded into the HTML body
-  ``/sqli``                           genuine boolean-differential behaviour
+  ``/``, ``/admin``, ``/api/v1/users``  distinct pages a probe should find
+  ``/xss``             reflects input unencoded into the HTML body
+  ``/attr-xss``        reflects into a quoted attribute without encoding the quote
+  ``/sqli``            genuine boolean-differential behaviour
+  ``/redirect``        sends Location: wherever the parameter points
+  ``/cors``            reflects any Origin and allows credentials
+  ``/download``        resolves ``../`` and serves the file it lands on
+  ``/template``        evaluates the expression it is given
+  ``/ping``            concatenates input into a command line
+  ``/fetch``           requests any URL the parameter names
 
 **Deliberate false-positive traps**
   unknown paths      HTTP 200 carrying a "not found" page (soft-404), so a
                      scanner without baseline learning thinks every path exists
   ``/reflect``       reflects input but HTML-encodes it, so it is inert
+  ``/attr``          reflects into an attribute but encodes the quote
   ``/static-error``  always contains a SQL error string, whatever you send
   ``/jitter``        random latency, which mimics time-based injection
   ``/waf``           returns a block page, as a WAF would
+  ``/echo-url``      echoes a URL into the page but never redirects to it
+  ``/cors-public``   allows any origin with ``*`` and no credentials, which is
+                     the intended configuration for a public API
+  ``/docs/passwd``   a page documenting ``/etc/passwd``, so it contains the
+                     ``root:x:0:0`` signature without being a traversal
+  ``/braces``        prints ``{{7*7}}`` back without evaluating it
+  ``/echo-cmd``      echoes the command string, canary included, without running it
+  ``/internal-only`` fetches a fixed internal URL whatever the parameter says
 
 Each trap corresponds to a class of finding other scanners report and ReconX is
 supposed to discard. The integration tests assert both halves: the real issues
@@ -25,9 +45,13 @@ from __future__ import annotations
 
 import html
 import json
+import posixpath
 import random
+import re
 import threading
 import time
+import urllib.error
+import urllib.request
 from collections.abc import Iterator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -45,6 +69,18 @@ _HOME = """<!doctype html><html><head><title>Example Corp</title></head>
 <a href="/attr-xss?q=blue">Saved filter</a> &middot;
 <a href="/reflect?q=hello">Echo</a> &middot;
 <a href="/jitter?id=1">Slow report</a></p>
+<p>Tools: <a href="/redirect?next=/">Continue</a> &middot;
+<a href="/echo-url?next=/">Link check</a> &middot;
+<a href="/download?file=readme.txt">Docs</a> &middot;
+<a href="/docs/passwd?file=overview">Account files</a> &middot;
+<a href="/template?name=guest">Greeting</a> &middot;
+<a href="/braces?name=guest">Template preview</a> &middot;
+<a href="/ping?host=127.0.0.1">Ping</a> &middot;
+<a href="/echo-cmd?host=127.0.0.1">Diagnostics</a> &middot;
+<a href="/fetch?url=/">Fetch</a> &middot;
+<a href="/internal-only?url=/">Status</a> &middot;
+<a href="/cors">Account API</a> &middot;
+<a href="/cors-public">Version API</a></p>
 <form action="/xss"><input name="q"><input name="page"></form>
 <script src="/static/app.js"></script></body></html>"""
 
@@ -71,6 +107,29 @@ _STATIC_ERROR = """<!doctype html><html><head><title>Product</title></head>
 <pre>Notice: the legacy import job logged: You have an error in your SQL syntax
 near 'LIMIT 1' at line 3. This message is part of the page template.</pre>
 <p>Product id: %s</p></body></html>"""
+
+# A page that legitimately documents /etc/passwd. The traversal signature is in
+# its text for an innocent reason, exactly as /static-error carries SQL error
+# text. A scanner that greps for the signature reports this.
+_PASSWD_DOCS = """<!doctype html><html><head><title>Account files</title></head>
+<body><h1>Where accounts live</h1>
+<p>On a Unix host the account list is in <code>/etc/passwd</code>, one record per
+line. The superuser record looks like this:</p>
+<pre>root:x:0:0:root:/root:/bin/bash</pre>
+<p>Only the superuser can edit it.</p></body></html>"""
+
+# The real traversal target. Served only when the path resolves outside the
+# document root, which is what makes it a traversal rather than a normal read.
+_PASSWD_FILE = (
+    "root:x:0:0:root:/root:/bin/bash\n"
+    "daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n"
+    "www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin\n"
+)
+
+# A second file, because a real traversal reaches more than one and two
+# different record formats are what make the finding independent of any one
+# page happening to contain a signature.
+_GROUP_FILE = "root:x:0:\nadm:x:4:syslog\nwww-data:x:33:\n"
 
 _JS_FILE = """// app.js
 const API_BASE = "/api/v1";
@@ -111,10 +170,120 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def _redirect(self, location: str) -> None:
+        """A 302 whose Location is whatever was asked for. The real bug."""
+        body = b"<html><body>Redirecting...</body></html>"
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     @staticmethod
     def _one(params: dict[str, list[str]], name: str, default: str = "") -> str:
         values = params.get(name) or []
         return values[0] if values else default
+
+    # -- surrogates for the classes that need one -------------------------
+
+    @staticmethod
+    def _render_template(source: str) -> str:
+        """A deliberately small template engine, in the Jinja/Twig dialect.
+
+        It evaluates two things and nothing else: integer multiplication, and
+        multiplying an integer by a numeric string, which that dialect answers by
+        repeating the string. Both are pure, so the surrogate is a real
+        evaluation without being a real sandbox escape.
+        """
+
+        def evaluate(match: re.Match[str]) -> str:
+            expression = match.group(1).strip()
+            repeat = re.fullmatch(r"(\d{1,4})\s*\*\s*'(\d{1,4})'", expression)
+            if repeat:
+                return str(repeat.group(2)) * int(repeat.group(1))
+            product = re.fullmatch(r"(\d{1,6})\s*\*\s*(\d{1,6})", expression)
+            if product:
+                return str(int(product.group(1)) * int(product.group(2)))
+            # Anything the engine cannot parse raises, as a real one would.
+            return "[TemplateSyntaxError]"
+
+        return re.sub(r"\{\{(.*?)\}\}", evaluate, source)
+
+    @staticmethod
+    def _run_shell(command: str) -> str:
+        """What a vulnerable ``system("ping " + host)`` would print.
+
+        Nothing is executed. Three read-only shell behaviours are simulated,
+        because those are the ones a scanner needs and none of them writes,
+        deletes or reaches the network: arithmetic expansion, which spawns no
+        process at all; command substitution around ``expr``, which computes and
+        exits; and ``echo``, a builtin. An unterminated expansion is left alone,
+        exactly as a shell leaves it.
+        """
+        out = command
+
+        def arithmetic(match: re.Match[str]) -> str:
+            return str(int(match.group(1)) * int(match.group(2)))
+
+        def expr_product(match: re.Match[str]) -> str:
+            return str(int(match.group(1)) * int(match.group(2)))
+
+        out = re.sub(r"\$\(\((\d{1,6})\s*\*\s*(\d{1,6})\)\)", arithmetic, out)
+        # $(expr a \* b) and `expr a \* b`: command substitution, a different
+        # mechanism from arithmetic expansion and defeatable separately.
+        expr_body = r"expr\s+(\d{1,6})\s*\\?\*\s*(\d{1,6})"
+        out = re.sub(rf"\$\(\s*{expr_body}\s*\)", expr_product, out)
+        out = re.sub(rf"`\s*{expr_body}\s*`", expr_product, out)
+        # $(echo x) and `echo x` both substitute the argument.
+        out = re.sub(r"\$\(\s*echo\s+([^)]*)\)", lambda m: m.group(1), out)
+        out = re.sub(r"`\s*echo\s+([^`]*)`", lambda m: m.group(1), out)
+        # ; echo x runs a second command whose output follows the first.
+        parts = re.split(r"[;&|]+", out)
+        rendered: list[str] = []
+        for part in parts:
+            stripped = part.strip()
+            echoed = re.fullmatch(r"echo\s+(.*)", stripped)
+            rendered.append(echoed.group(1) if echoed else stripped)
+        return "\n".join(filter(None, rendered))
+
+    def _server_side_fetch(self, url: str, *, forced: bool = False) -> str:
+        """Fetch a URL server-side, refusing anything that is not loopback.
+
+        A test fixture that fetched arbitrary URLs would be an open proxy, so the
+        host is checked here. The SSRF being simulated is the *reachability* of a
+        callback, which loopback demonstrates completely.
+        """
+        from urllib.parse import urlsplit as _split
+
+        parsed = _split(url)
+        if parsed.scheme not in {"http", "https"} or parsed.hostname not in {
+            "127.0.0.1", "localhost", "::1",
+        }:
+            return (
+                "<html><title>Fetch</title><body><p>Refused: only loopback URLs "
+                "are fetched by this fixture.</p></body></html>"
+            )
+        try:
+            with urllib.request.urlopen(url, timeout=3) as handle:  # noqa: S310
+                body = handle.read(4096).decode("utf-8", errors="replace")
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            body = f"fetch failed: {type(exc).__name__}"
+        label = "fixed internal URL" if forced else "requested URL"
+        return (
+            f"<html><title>Fetch</title><body><h1>Fetched the {label}</h1>"
+            f"<pre>{html.escape(body[:1000])}</pre></body></html>"
+        )
+
+    @staticmethod
+    def _sleep_for(command: str) -> float:
+        """Honour a `sleep N` the way a vulnerable shell would, bounded."""
+        match = re.search(r"\bsleep\s+(\d{1,2})", command)
+        if not match:
+            return 0.0
+        seconds = min(int(match.group(1)), 6)
+        time.sleep(seconds)
+        return float(seconds)
 
     # -- routing ----------------------------------------------------------
 
@@ -223,6 +392,123 @@ class _Handler(BaseHTTPRequestHandler):
                 + " value=" + chr(34) + value + chr(34) + chr(62)
                 + "</body></html>",
             )
+        # === open redirect =================================================
+        # Real: the parameter becomes the Location header verbatim.
+        elif path == "/redirect":
+            destination = self._one(params, "next", "/")
+            self._redirect(destination)
+        # Trap: the URL is printed into the page and never redirected to. A
+        # scanner that looks for its sentinel anywhere in the response fires.
+        elif path == "/echo-url":
+            value = html.escape(self._one(params, "next"))
+            self._send(
+                200,
+                "<!doctype html><html><head><title>Link</title></head><body>"
+                f"<p>You asked for <code>{value}</code>. We do not follow "
+                "external links.</p></body></html>",
+            )
+
+        # === CORS =========================================================
+        # Real: any origin is reflected, and credentials are allowed with it,
+        # so any site can read this response as the logged-in user.
+        elif path == "/cors":
+            origin = self.headers.get("Origin") or "*"
+            payload = json.dumps({"balance": 4200, "owner": "alice"})
+            encoded = payload.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Credentials", "true")
+            self.send_header("Vary", "Origin")
+            self.end_headers()
+            self.wfile.write(encoded)
+        # Trap: a wildcard origin with no credentials. This is how a public API
+        # is supposed to be configured, and reporting it wastes a triager's time.
+        elif path == "/cors-public":
+            payload = json.dumps({"version": "1.4.0", "status": "ok"})
+            encoded = payload.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(encoded)
+
+        # === path traversal ===============================================
+        # Real: the filename is joined to a root and normalised, so ../ escapes.
+        elif path == "/download":
+            requested = self._one(params, "file", "readme.txt")
+            resolved = posixpath.normpath(posixpath.join("/srv/docs", requested))
+            if resolved == "/etc/passwd":
+                self._send(200, _PASSWD_FILE, "text/plain")
+            elif resolved == "/etc/group":
+                self._send(200, _GROUP_FILE, "text/plain")
+            elif resolved.startswith("/srv/docs/"):
+                name = html.escape(posixpath.basename(resolved))
+                self._send(
+                    200,
+                    "<!doctype html><html><head><title>Document</title></head>"
+                    f"<body><h1>{name}</h1><p>Document contents.</p></body></html>",
+                )
+            else:
+                self._send(404, "<html><title>Not Found</title><body>404</body></html>")
+        # Trap: a page that documents /etc/passwd, so the signature is in its
+        # text for an innocent reason. The same shape as /static-error.
+        elif path == "/docs/passwd":
+            self._send(200, _PASSWD_DOCS)
+
+        # === server-side template injection ===============================
+        # Real: the parameter is rendered as a template, not as data.
+        elif path == "/template":
+            rendered = self._render_template(self._one(params, "name", "guest"))
+            self._send(
+                200,
+                "<!doctype html><html><head><title>Greeting</title></head><body>"
+                f"<h1>Hello {html.escape(rendered)}</h1></body></html>",
+            )
+        # Trap: the braces come back untouched. Reflected, never evaluated.
+        elif path == "/braces":
+            value = html.escape(self._one(params, "name"))
+            self._send(
+                200,
+                "<!doctype html><html><head><title>Preview</title></head><body>"
+                f"<p>Template source: <code>{value}</code></p></body></html>",
+            )
+
+        # === command injection ============================================
+        # Real: the parameter is concatenated into a command line.
+        elif path == "/ping":
+            host = self._one(params, "host", "localhost")
+            command = f"ping -c 1 {host}"
+            self._sleep_for(command)
+            self._send(
+                200,
+                "<!doctype html><html><head><title>Ping</title></head><body><pre>"
+                f"{html.escape(self._run_shell(command))}\n1 packet transmitted"
+                "</pre></body></html>",
+            )
+        # Trap: the command line is echoed into the page without being run, so a
+        # canary comes back whether or not anything executed.
+        elif path == "/echo-cmd":
+            host = self._one(params, "host", "localhost")
+            self._send(
+                200,
+                "<!doctype html><html><head><title>Diagnostics</title></head><body>"
+                f"<pre>would run: ping -c 1 {html.escape(host)}</pre></body></html>",
+            )
+
+        # === SSRF =========================================================
+        # Real: the parameter names a URL and the server fetches it. Restricted
+        # to loopback so this fixture can never be used to reach anything real.
+        elif path == "/fetch":
+            self._send(200, self._server_side_fetch(self._one(params, "url")))
+        # Trap: fetches internally, but always the same fixed URL, so the
+        # parameter cannot be redirected outward.
+        elif path == "/internal-only":
+            del params
+            self._send(200, self._server_side_fetch(f"http://127.0.0.1:{self.server.server_address[1]}/robots.txt", forced=True))
+
         # --- trap: a SQL error string that is always present ---------------
         elif path == "/static-error":
             self._send(200, _STATIC_ERROR % html.escape(self._one(params, "id", "1")))

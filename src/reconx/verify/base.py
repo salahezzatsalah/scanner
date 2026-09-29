@@ -37,7 +37,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, ClassVar
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from reconx.db.models import FindingTier
 from reconx.verify.waf import WafState, WafVerdict, classify_response
@@ -98,9 +98,15 @@ class PreparedRequest:
     headers: Mapping[str, str] = field(default_factory=dict)
     data: Mapping[str, str] | None = None
     json_body: Any = None
+    #: Off when the *redirect itself* is the thing under test, so the hop is
+    #: read from the Location header rather than walked. ReconX never follows a
+    #: redirect off-scope in either case; this stops it being attempted at all.
+    follow_redirects: bool = True
 
     def kwargs(self) -> dict[str, Any]:
         out: dict[str, Any] = {}
+        if not self.follow_redirects:
+            out["follow_redirects"] = False
         if self.headers:
             out["headers"] = dict(self.headers)
         if self.data is not None:
@@ -120,20 +126,32 @@ class PreparedRequest:
         return None
 
 
-def set_parameter(url: str, name: str, value: str) -> str:
+def set_parameter(url: str, name: str, value: str, *, raw: bool = False) -> str:
     """Return ``url`` with query parameter ``name`` set to ``value``.
 
     Appends the parameter when the URL does not already carry it, so a guessed
     name can be tested on an endpoint that declares nothing.
+
+    ``raw`` places the value in the query string without percent-encoding it.
+    That is needed for any payload whose *encoding* is the point: a value of
+    ``..%2f`` normally leaves as ``..%252f`` and arrives as the literal text
+    ``..%2f``, so a filter-bypass probe silently stops being one. Only the
+    payload is raw; every other parameter is still encoded normally.
     """
     parts = urlsplit(url)
     pairs = parse_qsl(parts.query, keep_blank_values=True)
     replaced = [(key, value if key == name else existing) for key, existing in pairs]
     if not any(key == name for key, _ in pairs):
         replaced.append((name, value))
-    return urlunsplit(
-        (parts.scheme, parts.netloc, parts.path, urlencode(replaced, doseq=True), "")
-    )
+
+    if raw:
+        query = "&".join(
+            f"{quote(key, safe='')}={item if key == name else quote(item, safe='')}"
+            for key, item in replaced
+        )
+    else:
+        query = urlencode(replaced, doseq=True)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, query, ""))
 
 
 @dataclass(frozen=True)
@@ -177,32 +195,47 @@ class ParamTarget:
         where = self.location.value.replace("_", " ")
         return f"{self.name!r} in the {where}"
 
-    def apply(self, value: str, *, headers: Mapping[str, str] | None = None) -> PreparedRequest:
-        """Build the request that puts ``value`` into this parameter."""
+    def apply(
+        self,
+        value: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+        follow_redirects: bool = True,
+        raw: bool = False,
+    ) -> PreparedRequest:
+        """Build the request that puts ``value`` into this parameter.
+
+        ``raw`` sends the value without percent-encoding, for payloads whose own
+        encoding is what is being tested. It applies to query parameters; a body
+        or header value is already sent as given.
+        """
         merged = dict(headers or {})
         method = self.http_method
+        common = {"method": method, "follow_redirects": follow_redirects}
 
         if self.location is ParamLocation.QUERY:
             return PreparedRequest(
-                method=method, url=set_parameter(self.url, self.name, value), headers=merged
+                url=set_parameter(self.url, self.name, value, raw=raw),
+                headers=merged,
+                **common,
             )
         if self.location is ParamLocation.FORM:
             return PreparedRequest(
-                method=method,
                 url=self.url,
                 headers=merged,
                 data={**self.siblings, self.name: value},
+                **common,
             )
         if self.location is ParamLocation.JSON:
             return PreparedRequest(
-                method=method,
                 url=self.url,
                 headers=merged,
                 json_body={**self.siblings, self.name: value},
+                **common,
             )
         if self.location is ParamLocation.HEADER:
             merged[self.name] = value
-            return PreparedRequest(method=method, url=self.url, headers=merged)
+            return PreparedRequest(url=self.url, headers=merged, **common)
 
         # Cookie: merge into any cookie header the caller already set rather than
         # replacing it, so session context survives.
@@ -213,7 +246,7 @@ class ParamTarget:
         for key in [k for k in merged if k.lower() == "cookie"]:
             del merged[key]
         merged["Cookie"] = jar
-        return PreparedRequest(method=method, url=self.url, headers=merged)
+        return PreparedRequest(url=self.url, headers=merged, **common)
 
 
 # ---------------------------------------------------------------------------
@@ -522,9 +555,13 @@ def decide_from_oracles(
             ),
         )
 
-    disagreements = "; ".join(
-        oracle.reason for oracle in oracles if not oracle.agreed and oracle.reason
-    )
+    # Two oracles that failed for the same reason should say it once. Repeating
+    # it reads like two findings and buries anything that differs.
+    seen: list[str] = []
+    for oracle in oracles:
+        if not oracle.agreed and oracle.reason and oracle.reason not in seen:
+            seen.append(oracle.reason)
+    disagreements = "; ".join(seen)
     return Decision(
         tier=FindingTier.DISCARDED,
         confidence=0,

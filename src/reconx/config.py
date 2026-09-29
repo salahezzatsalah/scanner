@@ -44,6 +44,19 @@ class Settings(BaseSettings):
     # unnecessary; set it when Playwright's bundled browser does not match the
     # one installed on the machine.
     chromium_path: str = ""
+    # --- out-of-band callbacks -------------------------------------------
+    # The SSRF collaborator is off by default. When enabled it binds loopback and
+    # never contacts a third-party interaction service, because doing so would
+    # publish the target's hostnames to someone outside the program.
+    enable_oob_collaborator: bool = False
+    oob_bind_host: str = "127.0.0.1"
+    oob_bind_port: int = Field(default=0, ge=0, le=65535)
+    # An address the *target* can reach, for testing a remote host. Setting this
+    # is the operator's decision to expose a listener; the bind address above is
+    # what actually opens a port.
+    oob_public_base_url: str = ""
+    oob_callback_timeout_seconds: float = Field(default=8.0, gt=0)
+
     # Number of random labels used to probe for wildcard DNS
     wildcard_probe_count: int = Field(default=3, ge=1)
     # Number of random paths used to learn a soft-404 fingerprint

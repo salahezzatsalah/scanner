@@ -588,9 +588,16 @@ async def test_full_pipeline_surfaces_real_bugs_and_discards_the_traps(
 ) -> None:
     """The end-to-end claim, run through the orchestrator.
 
-    The fixture links six parameterised endpoints from its home page. Three are
-    genuinely vulnerable and three are traps that other scanners report. Nothing
-    is hinted to the pipeline: it crawls, discovers the parameters, and decides.
+    The fixture links every one of its endpoints from its home page: for each
+    vulnerability class, one where the bug is real and one where the same signal
+    appears innocently. Nothing is hinted to the pipeline. It crawls, discovers
+    the parameters, and decides -- and what it decides has to be right in both
+    directions, which is why the traps are asserted by their *reason* rather than
+    only by their tier.
+
+    The out-of-band collaborator is left off here, so SSRF is covered by
+    ``tests/test_new_classes.py`` instead. Its own test asserts that an untested
+    parameter reads as Needs review rather than as clean.
     """
     from sqlalchemy import select as sa_select
 
@@ -644,6 +651,16 @@ async def test_full_pipeline_surfaces_real_bugs_and_discards_the_traps(
     assert any("/attr-xss" in title for title in confirmed), (
         f"the attribute XSS was not confirmed: {confirmed}"
     )
+    for label, needle in (
+        ("open redirect", "Open redirect in 'next' at /redirect"),
+        ("path traversal", "Path traversal in 'file' at /download"),
+        ("template injection", "template injection in 'name' at /template"),
+        ("command injection", "Command injection in 'host' at /ping"),
+        ("CORS misconfiguration", "cross-origin reads at /cors"),
+    ):
+        assert any(needle in title for title in confirmed), (
+            f"the {label} case was not confirmed: {sorted(confirmed)}"
+        )
 
     # --- the traps, discarded for the right reasons -------------------------
     static_error = next(
@@ -670,6 +687,34 @@ async def test_full_pipeline_surfaces_real_bugs_and_discards_the_traps(
     )
     assert attr is not None, f"the encoded attribute was not discarded: {list(discarded)}"
     assert "inert" in attr
+
+    # Each new class has to reject its own trap, for its own stated reason.
+    for label, title_needle, reason_needle in (
+        ("the echoed URL", "Open redirect in 'next' at /echo-url",
+         "no Location header"),
+        ("the page documenting /etc/passwd", "Path traversal in 'file' at /docs/passwd",
+         "already contains"),
+        ("the reflected braces", "template injection in 'name' at /braces",
+         "reflected into the page untouched"),
+        ("the echoed command line", "Command injection in 'host' at /echo-cmd",
+         "prints its input rather than running it"),
+        ("the public wildcard CORS policy", "cross-origin reads at /cors-public",
+         "intended configuration"),
+    ):
+        found = next(
+            (reason for title, reason in discarded.items() if title_needle in title),
+            None,
+        )
+        assert found is not None, (
+            f"{label} was not discarded: {sorted(discarded)}"
+        )
+        assert reason_needle in found, f"{label} was discarded for the wrong reason: {found}"
+
+    # --- and none of the traps reached a finding ---------------------------
+    for trap in ("/echo-url", "/docs/passwd", "/braces", "/echo-cmd", "/cors-public"):
+        assert not any(trap in title for title in confirmed), (
+            f"{trap} was reported: {sorted(confirmed)}"
+        )
 
     # --- nothing vulnerable was reported on the safe endpoints -------------
     assert not any("/reflect" in title for title in confirmed)

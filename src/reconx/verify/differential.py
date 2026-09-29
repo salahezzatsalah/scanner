@@ -121,7 +121,10 @@ class DifferentialOracle:
                     f"the benign control produced the same {self._signal}, so the "
                     "payload did not cause it"
                 )
-            return False, f"no {self._signal} appeared"
+            # A detector that knows *why* the signal is absent says so, because
+            # "no signal" and "the signal's usual imposter was there instead"
+            # are different things to a reviewer reading a discard reason.
+            return False, payload_seen.detail or f"no {self._signal} appeared"
 
         outcome = await reproduce(
             probe, attempts=self._attempts, required=self._required

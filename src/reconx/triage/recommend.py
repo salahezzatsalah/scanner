@@ -99,6 +99,53 @@ PLAYBOOKS: dict[str, tuple[str, str]] = {
         "A template says where to look, not what is true. This one reproduced, "
         "which is not the same as being exploitable.",
     ),
+    "open_redirect": (
+        "Establish what the redirect is worth before reporting it. On its own it "
+        "is usually low: chain it with something that trusts the destination, such "
+        "as an OAuth redirect_uri, a password-reset link, or a token in the "
+        "fragment that survives the hop.",
+        "An open redirect with no chain is routinely closed as informational. The "
+        "report that lands is the one showing what leaks across the hop.",
+    ),
+    "cors_misconfiguration": (
+        "Show what an attacking page can actually read. Name one endpoint that "
+        "returns something sensitive to a cookie-authenticated request, and prove "
+        "the reflected origin plus credentials makes it readable cross-origin.",
+        "Reflecting an origin without credentials is usually not exploitable, and "
+        "a wildcard '*' never is. The fix is an allowlist compared exactly, not a "
+        "substring match.",
+    ),
+    "path_traversal": (
+        "You have proved the boundary is crossed. Stop there and report it: name "
+        "the parameter, the depth needed, and the one file record you matched. Do "
+        "not walk the filesystem or read application configuration.",
+        "Impact is established by the boundary crossing, not by how much you read. "
+        "Reading beyond proof turns a clean report into a data-handling problem.",
+    ),
+    "template_injection": (
+        "Report the evaluation itself, with the engine named and the computed "
+        "value as proof. Whether to go further towards code execution is a "
+        "decision for the program's rules, not a default.",
+        "Template injection is usually rated on what the engine allows, so naming "
+        "the engine is most of the triage. An unsandboxed engine is critical; a "
+        "sandboxed one may be medium.",
+    ),
+    "command_injection": (
+        "Report it on the computed value alone: the arithmetic the shell performed "
+        "is complete proof that the command string is under your control. Confirm "
+        "the affected parameter and the separator that worked.",
+        "This is normally critical and needs nothing further to demonstrate. "
+        "Running anything beyond arithmetic on someone else's host is the kind of "
+        "escalation that gets a report closed and an account banned.",
+    ),
+    "ssrf": (
+        "Establish reach, which is what decides severity: whether the request can "
+        "be pointed at cloud metadata, at an internal service, or only outward. "
+        "Report with the callback log and the exact parameter value.",
+        "A blind SSRF that can only reach the internet is usually low. The same bug "
+        "reaching a metadata endpoint or an internal admin service is critical, so "
+        "say which one you established and how.",
+    ),
     "misconfiguration": (
         "Work out what the misconfiguration actually enables before reporting it.",
         "Most misconfiguration reports are closed as informational because the "
