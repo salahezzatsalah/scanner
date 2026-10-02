@@ -52,7 +52,10 @@ TOOL_SPECS: dict[str, ToolSpec] = {
         install=f"{_GO} github.com/owasp-amass/amass/v4/...@master",
         fallback="subfinder and certificate transparency cover most of this ground",
         notes="Slow. Best run on a longer cadence than the rest of the pipeline.",
-        identity_pattern=r"amass",
+        # v3 and v4 both print a bare version ("v3.19.2", "v4.2.0") with no
+        # tool name, so matching the name alone reports an installed amass
+        # as missing. Accept the bare version too, as _PD_IDENTITY does.
+        identity_pattern=r"amass|v\d+\.\d+\.\d+",
     ),
     "alterx": ToolSpec(
         name="alterx",
