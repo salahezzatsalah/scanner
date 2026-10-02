@@ -1,4 +1,4 @@
-"""Verification tests for the six vulnerability classes added after SQLi and XSS.
+"""Verification tests for the vulnerability classes added after SQLi and XSS.
 
 Each class is tested the same way, because the same claim is being made about
 each one:
@@ -25,6 +25,13 @@ from reconx.scope.guard import ScopeGuard
 from reconx.verify.cmdi import CmdiVerifier
 from reconx.verify.collaborator import LocalCollaborator
 from reconx.verify.cors import CorsVerifier
+from reconx.verify.deser import (
+    _FORBIDDEN_TOKENS,
+    CORRUPT_VALUES,
+    VALID_PICKLES,
+    DeserVerifier,
+    find_deser_signature,
+)
 from reconx.verify.redirect import RedirectVerifier, redirect_target, sentinel_host
 from reconx.verify.ssrf import SsrfVerifier
 from reconx.verify.ssti import SstiVerifier
@@ -457,3 +464,72 @@ def test_a_remote_target_needs_a_reachable_listener_and_says_so() -> None:
 
     local = verifier._no_callback_reason("http://127.0.0.1:8080/f?url=x")
     assert "bound to loopback" not in local
+
+
+# ---------------------------------------------------------------------------
+# insecure deserialization
+# ---------------------------------------------------------------------------
+
+
+async def test_a_real_deserialization_is_confirmed_by_two_oracles(target) -> None:
+    async with await _client(target) as http:
+        verifier = DeserVerifier(http, attempts=2, required=2)
+        verdict = await verifier.verify(target.url("/pickle?data=Ti4="), "data")
+
+    assert verdict.tier is FindingTier.CONFIRMED
+    assert set(verdict.agreeing) == {"format_differential", "deserialization_error"}
+    assert verdict.engine_hint == "Python pickle"
+    assert verdict.confidence >= 90
+    assert verdict.evidence, "a confirmed finding must carry evidence"
+
+
+async def test_a_page_documenting_unpickling_errors_is_discarded(target) -> None:
+    """The defining false positive: the error string is in the page already."""
+    async with await _client(target) as http:
+        verifier = DeserVerifier(http, attempts=2, required=2)
+        verdict = await verifier.verify(
+            target.url("/pickle-docs?topic=overview"), "topic"
+        )
+
+    assert verdict.tier is FindingTier.DISCARDED
+    assert verdict.agreeing == []
+    assert "already present in the unmodified page" in verdict.reason
+
+
+async def test_a_parameter_that_deserializes_nothing_is_discarded(target) -> None:
+    async with await _client(target) as http:
+        verifier = DeserVerifier(http, attempts=2, required=2)
+        verdict = await verifier.verify(target.url("/echo-url?next=/"), "next")
+
+    assert verdict.tier is FindingTier.DISCARDED
+    assert verdict.agreeing == []
+    assert "deserializer error" in verdict.reason
+
+
+async def test_a_blocked_host_is_not_reported_as_deserialization(target) -> None:
+    async with await _client(target) as http:
+        verifier = DeserVerifier(http, attempts=2, required=2)
+        verdict = await verifier.verify(target.url("/waf?data=1"), "data")
+
+    assert verdict.obstructed is True
+    assert verdict.tier is FindingTier.NEEDS_REVIEW
+
+
+def test_deserialization_signatures_name_a_real_engine() -> None:
+    """A bare "error" match would fire on most of the internet."""
+    assert find_deser_signature(b"<p>Error: something broke</p>") is None
+    engine, _ = find_deser_signature(
+        b"<p>_pickle.UnpicklingError: invalid load key, 'x'.</p>"
+    )
+    assert engine == "Python pickle"
+
+
+def test_deserialization_probes_cannot_execute() -> None:
+    """No gadget, no reduce, no execution primitive in any probe value.
+
+    This is a property of the tool, not of a target, so it is asserted against
+    the payload tables rather than observed in a response.
+    """
+    for value in (*VALID_PICKLES, *(corrupt for _, corrupt in CORRUPT_VALUES)):
+        for token in _FORBIDDEN_TOKENS:
+            assert token not in value, f"a deserialization probe contains {token!r}"

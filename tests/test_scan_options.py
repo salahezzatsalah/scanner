@@ -131,6 +131,7 @@ def test_skipped_checks_reach_the_vulnerability_stage() -> None:
         "traversal": True,
         "ssti": True,
         "cmdi": False,
+        "deser": True,
         "ssrf": False,
     }
 

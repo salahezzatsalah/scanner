@@ -497,7 +497,8 @@ class ScanOptions(BaseModel):
     @classmethod
     def _known_checks(cls, value: list[str]) -> list[str]:
         known = {
-            "sqli", "xss", "redirect", "cors", "traversal", "ssti", "cmdi", "ssrf",
+            "sqli", "xss", "redirect", "cors", "traversal", "ssti", "cmdi",
+            "deser", "ssrf",
         }
         cleaned = [item.strip().lower() for item in value if item.strip()]
         unknown = sorted(set(cleaned) - known)

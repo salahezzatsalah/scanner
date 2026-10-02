@@ -291,6 +291,27 @@ async def test_finding_signals_accumulate_across_verification_passes(
     assert finding.tier == FindingTier.CONFIRMED
 
 
+def test_a_weaker_duplicate_verdict_does_not_overwrite_a_stronger_one() -> None:
+    """The same endpoint reached through a link and through a form yields two
+    verdicts. Last-wins turned a Confirmed finding into a Probable one, so
+    within one run the stronger stored verdict survives."""
+    from reconx.stages.vulns import keep_existing_verdict
+
+    assert keep_existing_verdict(
+        FindingTier.CONFIRMED, 7, FindingTier.PROBABLE, 7
+    ) is True
+    assert keep_existing_verdict(
+        FindingTier.PROBABLE, 7, FindingTier.CONFIRMED, 7
+    ) is False
+    assert keep_existing_verdict(
+        FindingTier.DISCARDED, 7, FindingTier.DISCARDED, 7
+    ) is True
+    # Across runs the newest verdict still wins, so a fixed bug clears.
+    assert keep_existing_verdict(
+        FindingTier.CONFIRMED, 7, FindingTier.DISCARDED, 8
+    ) is False
+
+
 async def test_evidence_attaches_a_runnable_reproduction(
     db_session: AsyncSession, program: Program
 ) -> None:

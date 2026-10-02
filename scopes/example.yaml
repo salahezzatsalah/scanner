@@ -78,8 +78,8 @@ scan_options:
   use_external_tools: true    # false forces the built-in Python paths
 
   # Vulnerability classes. Valid names: sqli, xss, redirect, cors, traversal,
-  # ssti, cmdi, ssrf. An unknown name is rejected when the scope is loaded
-  # rather than silently ignored.
+  # ssti, cmdi, deser, ssrf. An unknown name is rejected when the scope is
+  # loaded rather than silently ignored.
   skip_checks: []
   run_nuclei: true
   enable_timing: true         # the time-based SQLi oracle; slow, never confirms alone

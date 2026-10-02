@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from datetime import UTC
 from pathlib import Path
 from typing import Annotated
@@ -18,6 +19,7 @@ from reconx.config import get_settings
 from reconx.db.models import Asset, Finding, FindingTier, Program, ScanRun
 from reconx.db.session import get_session_factory, init_db
 from reconx.db.store import get_program, list_programs, upsert_program
+from reconx.live import LiveProgress
 from reconx.orchestrator import (
     STAGE_GROUPS,
     STAGE_REGISTRY,
@@ -40,7 +42,8 @@ err_console = Console(stderr=True)
 # Kept as names rather than imported flags so the CLI stays importable without
 # pulling in the whole verification stack at start-up.
 VULN_CHECK_NAMES: tuple[str, ...] = (
-    "sqli", "xss", "redirect", "cors", "traversal", "ssti", "cmdi", "ssrf",
+    "sqli", "xss", "redirect", "cors", "traversal", "ssti", "cmdi", "deser",
+    "ssrf",
 )
 
 
@@ -561,6 +564,16 @@ def scan_run(
             ),
         ),
     ] = False,
+    progress: Annotated[
+        bool,
+        typer.Option(
+            "--progress/--no-progress",
+            help=(
+                "Show a live view of stage status, request counts and findings "
+                "while the scan runs. On by default when output is a terminal."
+            ),
+        ),
+    ] = True,
 ) -> None:
     """Run the pipeline against a program."""
     skipped = _validate_checks(skip_check)
@@ -627,17 +640,30 @@ def scan_run(
             )
         )
 
+        # Live progress is a display concern only: same scan, more visibility.
+        # Off when piped so logs stay clean; --no-progress forces it off.
+        display = (
+            LiveProgress()
+            if progress and sys.stdout.isatty()
+            else None
+        )
         orchestrator = Orchestrator(
             scope,
             scope_yaml=raw,
             stage_instances=overrides,
             use_external_tools=not no_external_tools,
+            progress=display,
         )
+        if display is not None:
+            display.start()
         try:
             summary = await orchestrator.run(stage, resume_run_id=resume)
         except StagePlanError as exc:
-            err_console.print(f"[red]{exc}[/red]")
+            err_console.print(f"[red]{exc}")
             raise typer.Exit(code=2) from exc
+        finally:
+            if display is not None:
+                display.stop()
 
         _print_summary(summary, slug)
 

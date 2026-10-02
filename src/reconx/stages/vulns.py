@@ -13,10 +13,11 @@ before any of it becomes a reported finding:
   real browser execution.
 * **Subdomain takeover**, requiring delegation, an unclaimed service page, and a
   dangling check.
-* **Open redirect, CORS misconfiguration, path traversal, template injection and
-  command injection**, each requiring two independent oracles and each paired
-  with a deliberate trap in the test fixture. A class without a trap does not
-  ship, because nothing has shown it can say no.
+* **Open redirect, CORS misconfiguration, path traversal, template injection,
+  command injection and insecure deserialization**, each requiring two
+  independent oracles and each paired with a deliberate trap in the test
+  fixture. A class without a trap does not ship, because nothing has shown
+  it can say no.
 * **SSRF**, when the out-of-band collaborator is enabled. It is off by default
   because it opens a listening port, and it is local-only by design: using a
   hosted interaction service would publish the target's hostnames to a third
@@ -55,6 +56,7 @@ from reconx.verify.baseline import BaselineCollector
 from reconx.verify.cmdi import CmdiVerifier
 from reconx.verify.collaborator import LocalCollaborator
 from reconx.verify.cors import CorsVerifier
+from reconx.verify.deser import DeserVerifier
 from reconx.verify.redirect import RedirectVerifier
 from reconx.verify.reproduce import reproduce
 from reconx.verify.sqli import SqliVerifier
@@ -115,6 +117,17 @@ _URL_NAMES = frozenset({
 
 _URLISH = re.compile(r"^(?:https?://|//|/|\.\.?/)", re.IGNORECASE)
 _FILEISH = re.compile(r"[\w-]+\.[a-z0-9]{1,5}$|^/|\.\./", re.IGNORECASE)
+_DESER_NAMES = frozenset({
+    "data", "blob", "object", "obj", "serialized", "pickle", "state",
+    "viewstate", "javadata", "phpobject", "cart", "basket",
+})
+# A value that already looks like a serialized object: a Java stream, a PHP
+# object, or a dataclass-style pickle. Names miss these when a framework hides
+# them behind generic parameters, so the shape is checked too.
+_DESERISH = re.compile(
+    r"^(?:rO0[A-Za-z0-9+/=]+|O:\d+:\"|YTo|gAS)",
+    re.IGNORECASE,
+)
 
 
 def _name_of(entry: dict) -> str:
@@ -129,6 +142,35 @@ def _value_of(entry: dict) -> str:
         if key == name:
             return value
     return ""
+
+
+#: Strength order for verdicts about the same finding. A weaker duplicate must
+#: never overwrite a stronger one within a run: the same endpoint reached
+#: through a link and through a form produces two verdicts, and last-wins
+#: turned a Confirmed finding into a Probable one. Across runs the newest
+#: verdict still wins, so a fixed bug clears on rescan.
+_TIER_RANK = {
+    FindingTier.DISCARDED: 0,
+    FindingTier.NEEDS_REVIEW: 1,
+    FindingTier.PROBABLE: 2,
+    FindingTier.CONFIRMED: 3,
+}
+
+
+def keep_existing_verdict(
+    existing_tier: FindingTier,
+    existing_run_id: int | None,
+    new_tier: FindingTier,
+    current_run_id: int,
+) -> bool:
+    """Should the stored verdict survive this run's new one?
+
+    Same run and stored is at least as strong: yes. Anything else — a
+    stronger verdict, or a verdict from a newer run — replaces it.
+    """
+    if existing_run_id != current_run_id:
+        return False
+    return _TIER_RANK.get(existing_tier, 0) >= _TIER_RANK.get(new_tier, 0)
 
 
 @dataclass(frozen=True)
@@ -298,6 +340,24 @@ PARAMETER_CHECKS: tuple[ParameterCheck, ...] = (
         max_targets=30,
     ),
     ParameterCheck(
+        name="deser",
+        vuln_class="deserialization",
+        title_prefix="Insecure deserialization",
+        detector="reconx:deser",
+        severity=Severity.CRITICAL,
+        recommendation=(
+            "The endpoint parses the parameter as a serialized object. Report the "
+            "engine named and the accepted-versus-rejected pair as proof, and do "
+            "not send gadget chains: demonstrating code execution is an escalation "
+            "for the program to permit, not a default."
+        ),
+        build=_plain(DeserVerifier),
+        selects=lambda e: (
+            _name_of(e) in _DESER_NAMES or bool(_DESERISH.search(_value_of(e)))
+        ),
+        max_targets=40,
+    ),
+    ParameterCheck(
         name="ssrf",
         vuln_class="ssrf",
         title_prefix="Server-side request forgery",
@@ -343,6 +403,7 @@ class VulnStage(Stage):
         check_traversal: bool = True,
         check_ssti: bool = True,
         check_cmdi: bool = True,
+        check_deser: bool = True,
         check_ssrf: bool = True,
         enable_timing: bool = True,
         headless_xss: bool = True,
@@ -368,6 +429,7 @@ class VulnStage(Stage):
             "traversal": check_traversal,
             "ssti": check_ssti,
             "cmdi": check_cmdi,
+            "deser": check_deser,
             "ssrf": check_ssrf,
         }
 
@@ -904,11 +966,34 @@ class VulnStage(Stage):
             if verdict.parameter
             else f"{title_prefix} at {template}"
         )
+        dedup_key = f"{vuln_class}::{template}::{verdict.parameter}"
+
+        existing = (
+            await ctx.session.execute(
+                select(Finding).where(
+                    Finding.program_id == ctx.program_id,
+                    Finding.dedup_key == dedup_key,
+                )
+            )
+        ).scalars().first()
+        if (
+            existing is not None
+            and existing.scan_run_id is not None
+            and keep_existing_verdict(
+                existing.tier, existing.scan_run_id, verdict.tier, ctx.scan_run_id
+            )
+        ):
+            result.filtered("duplicate_verdict")
+            result.note(
+                f"kept the stronger stored verdict for {title} instead of "
+                f"overwriting it with {verdict.tier.value}"
+            )
+            return
 
         await self._save(
             ctx,
             result,
-            dedup_key=f"{vuln_class}::{template}::{verdict.parameter}",
+            dedup_key=dedup_key,
             vuln_class=vuln_class,
             title=title,
             severity=severity if verdict.vulnerable else Severity.INFO,

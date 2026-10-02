@@ -239,7 +239,7 @@ hand:
 scan_options:
   path_wordlist: "~/SecLists/Discovery/Web-Content/raft-medium-directories.txt"
   parameter_wordlist: "~/SecLists/Discovery/Web-Content/burp-parameter-names.txt"
-  skip_checks: ["cmdi"]        # sqli xss redirect cors traversal ssti cmdi ssrf
+  skip_checks: ["cmdi"]        # sqli xss redirect cors traversal ssti cmdi deser ssrf
   enable_timing: false         # slow, and never confirms alone
   ports: [80, 443, 8443]
 ```

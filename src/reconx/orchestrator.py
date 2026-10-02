@@ -20,7 +20,9 @@ ran with built-in wordlists and every default no matter what its operator wanted
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+import contextlib
+import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -56,12 +58,40 @@ __all__ = [
     "STAGE_REGISTRY",
     "STAGE_GROUPS",
     "Orchestrator",
+    "ProgressEvent",
     "build_stage",
     "RunSummary",
     "plan_stages",
     "resolve_stage_names",
     "StagePlanError",
 ]
+
+
+@dataclass
+class ProgressEvent:
+    """One realtime update from a running pipeline.
+
+    Emitted only when the orchestrator was given a ``progress`` callback;
+    without one the run is silent exactly as before. ``kind`` is one of
+    ``run_started``, ``stage_started``, ``stage_finished``, ``heartbeat`` or
+    ``run_finished``. Counters are cumulative for the run; ``findings`` holds
+    every surfaced finding label so far.
+    """
+
+    kind: str
+    stage: str = ""
+    status: str = ""
+    detail: str = ""
+    requests_made: int = 0
+    tool_requests: int = 0
+    dns_queries: int = 0
+    findings: list[str] = field(default_factory=list)
+    at: float = field(default_factory=time.monotonic)
+
+#: A sink for :class:`ProgressEvent`. Synchronous on purpose: it is called
+#: from the run loop, and anything it needs to await would serialize the scan
+#: behind the display. The CLI updates a Rich live view, which is cheap.
+ProgressCallback = Callable[[ProgressEvent], None]
 
 
 class StagePlanError(ValueError):
@@ -135,6 +165,7 @@ def build_stage(name: str, options: ScanOptions) -> Stage | None:
             check_traversal="traversal" not in skipped,
             check_ssti="ssti" not in skipped,
             check_cmdi="cmdi" not in skipped,
+            check_deser="deser" not in skipped,
             check_ssrf="ssrf" not in skipped,
         )
     return None
@@ -294,6 +325,8 @@ class Orchestrator:
         settings: Settings | None = None,
         stage_instances: dict[str, Stage] | None = None,
         use_external_tools: bool | None = None,
+        progress: ProgressCallback | None = None,
+        heartbeat_seconds: float = 5.0,
     ) -> None:
         self._scope = scope
         self._scope_yaml = scope_yaml or f"program: {scope.program}"
@@ -312,6 +345,8 @@ class Orchestrator:
         )
         # SQLite has a single-writer limit; see _run_level.
         self._serialize_stages = self._settings.database_url.startswith("sqlite")
+        self._progress = progress
+        self._heartbeat_seconds = max(1.0, heartbeat_seconds)
 
     @property
     def guard(self) -> ScopeGuard:
@@ -380,6 +415,19 @@ class Orchestrator:
                         "results describe the unauthenticated surface only"
                     )
 
+            self._emit(
+                ProgressEvent(
+                    kind="run_started",
+                    detail=",".join(names),
+                    requests_made=http.requests_made,
+                )
+            )
+            heartbeat: asyncio.Task | None = None
+            if self._progress is not None:
+                heartbeat = asyncio.create_task(
+                    self._heartbeat_loop(summary, http, dns, sources)
+                )
+
             try:
                 for level in levels:
                     # Between levels, not inside them: a session does not expire
@@ -416,6 +464,10 @@ class Orchestrator:
                 summary.status = RunStatus.FAILED
                 summary.error = f"{type(exc).__name__}: {exc}"
             finally:
+                if heartbeat is not None:
+                    heartbeat.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await heartbeat
                 summary.requests_made = http.requests_made
                 summary.tool_requests = http.external_requests
                 summary.dns_queries = dns.queries
@@ -445,7 +497,48 @@ class Orchestrator:
                 await http.aclose()
                 await sources.aclose()
 
+            self._emit(
+                ProgressEvent(
+                    kind="run_finished",
+                    status=summary.status.value,
+                    detail=summary.error or "",
+                    requests_made=summary.requests_made,
+                    tool_requests=summary.tool_requests,
+                    dns_queries=summary.dns_queries,
+                    findings=list(summary.findings),
+                )
+            )
             return summary
+
+    # -- realtime progress --------------------------------------------------
+
+    def _emit(self, event: ProgressEvent) -> None:
+        """Deliver one progress event, never letting the display break a scan."""
+        if self._progress is None:
+            return
+        # A display bug must not fail a scan. Cancellation is a BaseException,
+        # so it still propagates.
+        with contextlib.suppress(Exception):
+            self._progress(event)
+
+    def _counters(self, summary: RunSummary, http, dns, sources) -> dict[str, Any]:
+        return {
+            "requests_made": http.requests_made,
+            "tool_requests": http.external_requests,
+            "dns_queries": dns.queries,
+            "findings": list(summary.findings),
+        }
+
+    async def _heartbeat_loop(self, summary, http, dns, sources) -> None:
+        """Periodic totals while stages run. Cancelled when the run ends."""
+        try:
+            while True:
+                await asyncio.sleep(self._heartbeat_seconds)
+                self._emit(
+                    ProgressEvent(kind="heartbeat", **self._counters(summary, http, dns, sources))
+                )
+        except asyncio.CancelledError:
+            raise
 
     # -- internals --------------------------------------------------------
 
@@ -502,6 +595,7 @@ class Orchestrator:
         for name in level:
             if name in completed:
                 summary.skipped[name] = "already completed in this run"
+                self._emit(ProgressEvent(kind="stage_finished", stage=name, status="skipped"))
                 continue
             blocked = [
                 dependency
@@ -513,6 +607,7 @@ class Orchestrator:
                 summary.skipped[name] = (
                     f"skipped because {', '.join(blocked)} failed"
                 )
+                self._emit(ProgressEvent(kind="stage_finished", stage=name, status="skipped"))
                 async with factory() as bookkeeping:
                     stage_run = await start_stage_run(
                         bookkeeping, run_id, program_id, name
@@ -594,6 +689,7 @@ class Orchestrator:
         stage also means a stage that fails rolls back only its own work.
         """
         stage = self._stage(name)
+        self._emit(ProgressEvent(kind="stage_started", stage=name, status="running"))
 
         async with factory() as session:
             stage_run = await start_stage_run(session, run_id, program_id, name)
@@ -627,6 +723,12 @@ class Orchestrator:
                     error=f"{type(exc).__name__}: {exc}",
                 )
                 await session.commit()
+                self._emit(
+                    ProgressEvent(
+                        kind="stage_finished", stage=name, status="failed",
+                        detail=f"{type(exc).__name__}: {exc}",
+                    )
+                )
                 raise
 
             await finish_stage_run(
@@ -641,4 +743,15 @@ class Orchestrator:
                 checkpoint=result.checkpoint,
             )
             await session.commit()
+            self._emit(
+                ProgressEvent(
+                    kind="stage_finished",
+                    stage=name,
+                    status="completed",
+                    detail=(
+                        f"in={result.items_in} out={result.items_out} "
+                        f"filtered={result.items_filtered}"
+                    ),
+                )
+            )
             return result

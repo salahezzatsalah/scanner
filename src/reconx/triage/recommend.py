@@ -138,6 +138,16 @@ PLAYBOOKS: dict[str, tuple[str, str]] = {
         "Running anything beyond arithmetic on someone else's host is the kind of "
         "escalation that gets a report closed and an account banned.",
     ),
+    "deserialization": (
+        "Report the engine named and the accepted-versus-rejected pair as proof. "
+        "Establish impact by naming what the format allows, not by running a "
+        "gadget: a working gadget chain is usually critical, a property-injection "
+        "sink may be less, and the program decides which you may pursue.",
+        "Do not send gadget chains unasked. The finding is that untrusted bytes "
+        "reach a deserializer; demonstrating code execution from it is an "
+        "escalation, and on someone else's host it is the kind that gets an "
+        "account banned.",
+    ),
     "ssrf": (
         "Establish reach, which is what decides severity: whether the request can "
         "be pointed at cloud metadata, at an internal service, or only outward. "

@@ -10,10 +10,12 @@ from sqlmodel import select
 from reconx.db.models import Asset, RunStatus, StageRun
 from reconx.db.session import get_session_factory
 from reconx.db.store import upsert_asset
+from reconx.live import LiveProgress
 from reconx.orchestrator import (
     STAGE_GROUPS,
     STAGE_REGISTRY,
     Orchestrator,
+    ProgressEvent,
     StagePlanError,
     plan_stages,
     resolve_stage_names,
@@ -338,3 +340,86 @@ async def test_a_failure_in_a_serialized_level_does_not_stop_its_siblings(
     assert "failed" in summary.skipped["passive_recon"]
     assert "subdomains" in summary.stages
     assert "survived.example.com" in summary.new_assets
+
+
+# ---------------------------------------------------------------------------
+# realtime progress
+# ---------------------------------------------------------------------------
+
+
+async def test_progress_events_follow_a_run_start_to_finish(file_db) -> None:
+    """The display must see every stage open and close, in order."""
+    events: list[ProgressEvent] = []
+    scope = make_scope(in_scope=["*.example.com"], out_of_scope=[])
+    orchestrator = Orchestrator(
+        scope,
+        use_external_tools=False,
+        progress=events.append,
+        stage_instances={
+            "passive_recon": _WritingStage("passive_recon", []),
+            "subdomains": _WritingStage("subdomains", ["a.example.com"]),
+            "resolve_probe": _WritingStage("resolve_probe", []),
+        },
+    )
+    summary = await orchestrator.run(["recon"])
+
+    kinds = [(event.kind, event.stage) for event in events]
+    assert kinds[0] == ("run_started", "")
+    assert ("stage_started", "subdomains") in kinds
+    assert ("stage_finished", "subdomains") in kinds
+    assert kinds[-1][0] == "run_finished"
+    # Every started stage finishes, even the failing-free fast ones.
+    started = {stage for kind, stage in kinds if kind == "stage_started"}
+    finished = {stage for kind, stage in kinds if kind == "stage_finished"}
+    assert started <= finished
+    assert summary.status.value == "completed"
+
+
+async def test_a_broken_display_callback_cannot_fail_a_run(file_db) -> None:
+    """The progress sink is display-only: raising inside it changes nothing."""
+
+    def broken(event: ProgressEvent) -> None:
+        raise AssertionError("the display is on fire")
+
+    scope = make_scope(in_scope=["*.example.com"], out_of_scope=[])
+    orchestrator = Orchestrator(
+        scope,
+        use_external_tools=False,
+        progress=broken,
+        stage_instances={
+            "passive_recon": _WritingStage("passive_recon", []),
+            "subdomains": _WritingStage("subdomains", ["a.example.com"]),
+            "resolve_probe": _WritingStage("resolve_probe", []),
+        },
+    )
+    summary = await orchestrator.run(["recon"])
+
+    assert summary.status.value == "completed"
+    assert "subdomains" in summary.stages
+
+
+def test_live_progress_accumulates_counts_and_findings() -> None:
+    """The table state advances on events without a terminal attached."""
+    view = LiveProgress()
+    view(ProgressEvent(kind="run_started", detail="subdomains,resolve_probe"))
+    view(ProgressEvent(kind="stage_started", stage="subdomains", status="running"))
+    view(
+        ProgressEvent(
+            kind="heartbeat", requests_made=41, dns_queries=7,
+            findings=["CONFIRMED | HIGH: Something in 'q' at /x"],
+        )
+    )
+    view(
+        ProgressEvent(
+            kind="stage_finished", stage="subdomains", status="completed",
+            detail="in=3 out=2 filtered=0", requests_made=41, dns_queries=7,
+        )
+    )
+
+    assert view._status["subdomains"] == "completed"
+    assert view._requests == 41
+    assert view._dns == 7
+    assert view._findings == ["CONFIRMED | HIGH: Something in 'q' at /x"]
+    # Rendering must not raise with or without stages.
+    view.render()
+    LiveProgress().render()

@@ -18,6 +18,8 @@ class without a trap is not trustworthy, because nothing has shown it can say no
   ``/template``        evaluates the expression it is given
   ``/ping``            concatenates input into a command line
   ``/fetch``           requests any URL the parameter names
+  ``/pickle``          base64-decodes the parameter and unpickles it, leaking a
+                       real ``UnpicklingError`` on malformed input
 
 **Deliberate false-positive traps**
   unknown paths      HTTP 200 carrying a "not found" page (soft-404), so a
@@ -35,6 +37,8 @@ class without a trap is not trustworthy, because nothing has shown it can say no
   ``/braces``        prints ``{{7*7}}`` back without evaluating it
   ``/echo-cmd``      echoes the command string, canary included, without running it
   ``/internal-only`` fetches a fixed internal URL whatever the parameter says
+  ``/pickle-docs``   documents unpickling errors, so ``UnpicklingError`` text is
+                     in the page for an innocent reason
 
 Each trap corresponds to a class of finding other scanners report and ReconX is
 supposed to discard. The integration tests assert both halves: the real issues
@@ -43,8 +47,11 @@ are found, and the traps are rejected with the right reason.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import html
 import json
+import pickle
 import posixpath
 import random
 import re
@@ -80,6 +87,8 @@ _HOME = """<!doctype html><html><head><title>Example Corp</title></head>
 <a href="/echo-cmd?host=127.0.0.1">Diagnostics</a> &middot;
 <a href="/fetch?url=/">Fetch</a> &middot;
 <a href="/internal-only?url=/">Status</a> &middot;
+<a href="/pickle?data=Ti4=">Saved cart</a> &middot;
+<a href="/pickle-docs?topic=overview">Serialization docs</a> &middot;
 <a href="/cors">Account API</a> &middot;
 <a href="/cors-public">Version API</a></p>
 <form action="/xss"><input name="q"><input name="page"></form>
@@ -528,6 +537,60 @@ class _Handler(BaseHTTPRequestHandler):
         elif path == "/internal-only":
             del params
             self._send(200, self._server_side_fetch(f"http://127.0.0.1:{self.server.server_address[1]}/robots.txt", forced=True))
+
+        # === insecure deserialization =====================================
+        # Real: the parameter is base64-decoded and unpickled. A well-formed
+        # object loads into a normal page; a corrupt one raises a genuine
+        # ``UnpicklingError`` with a 500. Both behaviours are real, and
+        # together they are what two independent oracles should agree on.
+        elif path == "/pickle":
+            raw = self._one(params, "data", "")
+            if not raw:
+                self._send(
+                    200,
+                    "<!doctype html><html><head><title>Cart</title></head><body>"
+                    "<h1>Saved cart</h1><p>Send base64-encoded state.</p></body></html>",
+                )
+            else:
+                try:
+                    blob = base64.b64decode(raw, validate=True)
+                except (binascii.Error, ValueError):
+                    self._send(
+                        200,
+                        "<!doctype html><html><head><title>Cart</title></head><body>"
+                        "<h1>Saved cart</h1><p>Expected base64-encoded state.</p>"
+                        "</body></html>",
+                    )
+                else:
+                    try:
+                        obj = pickle.loads(blob)
+                    except Exception as exc:
+                        self._send(
+                            500,
+                            "<html><title>Cart</title><body><p>Unhandled "
+                            f"{type(exc).__module__}.{type(exc).__name__}: {exc}"
+                            "</p></body></html>",
+                        )
+                    else:
+                        self._send(
+                            200,
+                            "<!doctype html><html><head><title>Cart</title></head><body>"
+                            f"<h1>Saved cart</h1><p>Loaded {html.escape(type(obj).__name__)}."
+                            "</p></body></html>",
+                        )
+        # Trap: documents unpickling errors, so ``UnpicklingError`` text is in
+        # the page for an innocent reason. The same shape as /static-error.
+        elif path == "/pickle-docs":
+            topic = html.escape(self._one(params, "topic", "overview"))
+            self._send(
+                200,
+                "<!doctype html><html><head><title>Serialization docs</title></head>"
+                "<body><h1>Unpickling without validation</h1>"
+                "<p>Never pass user input to <code>pickle.loads</code>. A corrupt "
+                "value raises <code>_pickle.UnpicklingError: invalid load key, "
+                "'x'</code> instead of loading.</p>"
+                f"<p>Topic: {topic}</p></body></html>",
+            )
 
         # === the authenticated surface ====================================
         # Everything under /account needs the session. A scanner without one sees
